@@ -1,0 +1,10 @@
+node_modules/
+.credentials.json
+.env
+.env.example
+.pm2/
+*.log
+data/
+.git/
+README.md
+docker-compose.yml

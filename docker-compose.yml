@@ -1,0 +1,17 @@
+services:
+  copilot-proxy:
+    build: .
+    container_name: copilot-proxy
+    restart: unless-stopped
+    ports:
+      - "3456:3456"
+    environment:
+      - PROXY_API_KEY=${PROXY_API_KEY}
+      - CREDENTIALS_PATH=/data/.credentials.json
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3456/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
