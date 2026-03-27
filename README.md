@@ -32,7 +32,7 @@ curl -X POST http://localhost:3456/admin/auth \
 
 ## API Endpoints
 
-所有端點（除 `/health`）需要 `Authorization: Bearer <PROXY_API_KEY>`。
+所有端點（除 `/health`）需要 API Key 認證（支援 `Authorization: Bearer`、`x-api-key`、`api-key` 三種 header）。
 
 ### OpenAI 相容
 
@@ -76,6 +76,37 @@ curl http://localhost:3456/health
 | Anthropic | claude-opus-4.6, claude-opus-4.5, claude-sonnet-4.5, claude-sonnet-4 |
 | OpenAI | gpt-4o, gpt-4o-mini, gpt-4, gpt-4.1 |
 | Google | gemini-2.5-pro, gemini-3-flash-preview |
+
+## 認證方式
+
+支援三種 API Key Header（皆傳同一組 `PROXY_API_KEY`）：
+
+| Header | 格式 | 適用場景 |
+|--------|------|----------|
+| `Authorization` | `Bearer <PROXY_API_KEY>` | OpenAI SDK、Dify、大多數工具 |
+| `x-api-key` | `<PROXY_API_KEY>` | Anthropic 風格、部分工具 |
+| `api-key` | `<PROXY_API_KEY>` | Azure 風格 |
+
+## Xcode 26 Intelligence 設定
+
+### Internet Hosted（推薦）
+
+| 欄位 | 值 |
+|------|-----|
+| URL | `https://your-domain/v1` |
+| API Key | `Bearer YOUR_PROXY_API_KEY`（含 Bearer 前綴） |
+| API Key Header | `Authorization` |
+| Description | Copilot Proxy |
+
+> ⚠️ Xcode 的 API Key 欄位要填完整的 `Bearer <key>`，因為 Xcode 不會自動加 `Bearer` 前綴。
+
+### Locally Hosted（免驗證）
+
+如果 Proxy 跑在本地且 `PROXY_API_KEY` 設為空：
+
+| 欄位 | 值 |
+|------|-----|
+| Port | `3456` |
 
 ## 環境變數
 

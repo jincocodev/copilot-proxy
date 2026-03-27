@@ -14,6 +14,15 @@ const app = express();
 const PORT = process.env.PORT || 3456;
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
 
+// ── CORS ──
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 let stats = {
   requestsTotal: 0,
   requestsSuccess: 0,
@@ -28,8 +37,15 @@ app.use(express.json({ limit: "10mb" }));
 // API key auth for /v1/* endpoints
 function apiKeyAuth(req, res, next) {
   if (!PROXY_API_KEY) return next(); // no key set = open
+  // Support multiple auth methods:
+  // 1. Authorization: Bearer <key>
+  // 2. x-api-key: <key>
+  // 3. api-key: <key> (Azure style)
   const auth = req.headers.authorization;
-  if (!auth || auth !== `Bearer ${PROXY_API_KEY}`) {
+  const xApiKey = req.headers["x-api-key"];
+  const apiKey = req.headers["api-key"];
+  const token = auth?.startsWith("Bearer ") ? auth.slice(7) : (xApiKey || apiKey);
+  if (!token || token !== PROXY_API_KEY) {
     return res.status(401).json({ error: { message: "Invalid API key" } });
   }
   next();
