@@ -37,15 +37,8 @@ app.use(express.json({ limit: "10mb" }));
 // API key auth for /v1/* endpoints
 function apiKeyAuth(req, res, next) {
   if (!PROXY_API_KEY) return next(); // no key set = open
-  // Support multiple auth methods:
-  // 1. Authorization: Bearer <key>
-  // 2. x-api-key: <key>
-  // 3. api-key: <key> (Azure style)
   const auth = req.headers.authorization;
-  const xApiKey = req.headers["x-api-key"];
-  const apiKey = req.headers["api-key"];
-  const token = auth?.startsWith("Bearer ") ? auth.slice(7) : (xApiKey || apiKey);
-  if (!token || token !== PROXY_API_KEY) {
+  if (!auth || auth !== `Bearer ${PROXY_API_KEY}`) {
     return res.status(401).json({ error: { message: "Invalid API key" } });
   }
   next();
