@@ -93,9 +93,14 @@ function resolveModel(requested, availableIds) {
 
 const DEFAULT_MODEL = "claude-sonnet-4.5";
 
-// 去掉尾端日期後綴：claude-sonnet-4-5-20250929 → claude-sonnet-4-5
+// 去掉尾端的日期／變體後綴：
+//   claude-sonnet-4-5-20250929 → claude-sonnet-4-5
+//   claude-fable-5[1m]         → claude-fable-5   （Claude Code 的 1M context 變體）
 function stripDateSuffix(model) {
-  return model.replace(/-\d{8}$/, "").replace(/-latest$/, "");
+  return model
+    .replace(/\[[^\]]*\]$/, "")
+    .replace(/-\d{8}$/, "")
+    .replace(/-latest$/, "");
 }
 
 // availableIds 有給就依即時清單解析，沒給就退回靜態表。
@@ -537,6 +542,7 @@ export {
   mapModel,
   resolveModel,
   classifyTier,
+  stripDateSuffix,
   FALLBACK_MODEL_MAP,
   mapStopReason,
   flattenSystem,

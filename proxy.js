@@ -7,6 +7,7 @@ import {
   mapModel,
 } from "./anthropic-adapter.js";
 import { AnthropicStreamTranslator } from "./anthropic-stream.js";
+import { classifyTier, stripDateSuffix } from "./anthropic-adapter.js";
 import {
   supportsNativeMessages,
   prepareNativeBody,
@@ -41,6 +42,10 @@ function hasImageContent(body) {
 // ── 上游模型清單 ────────────────────────────────────────────
 // 硬寫清單會過期（實際踩過：Copilot 下架了 claude-sonnet-4，但我們還在送，
 // 每次都拿 400 model_not_supported）。改成問上游，快取 10 分鐘。
+
+// 伺服器端強制指定的模型。Claude Code 用 /model 存過的預設會蓋掉
+// ANTHROPIC_MODEL 環境變數，所以要在 proxy 這邊才壓得住。
+const DEFAULT_MODEL_OVERRIDE = (process.env.COPILOT_DEFAULT_MODEL || "").trim() || null;
 
 // 伺服器端預設思考檔位。Claude Code 不一定會把它自己的 effort 設定透過
 // Anthropic 協議送出來，所以留一個不依賴 client 的開關。
@@ -87,6 +92,15 @@ async function getUpstreamModels() {
   })();
 
   return modelsCache.inFlight;
+}
+
+// COPILOT_DEFAULT_MODEL 的套用規則。
+// 刻意跳過 haiku 階：那是 Claude Code 跑背景小任務用的，把它抬成 opus
+// 只會白花錢，而且那些任務不需要好模型。
+function applyModelOverride(requested) {
+  if (!DEFAULT_MODEL_OVERRIDE) return requested;
+  if (classifyTier(stripDateSuffix(requested || "")) === "haiku") return requested;
+  return DEFAULT_MODEL_OVERRIDE;
 }
 
 // 原生 /v1/messages 用的 header。Anthropic 協議自己的 header 要帶過去。
@@ -208,7 +222,7 @@ async function anthropicRequest(req, res) {
 
   // 依上游即時清單挑模型，取不到清單就退回靜態對照
   const upstreamModels = await getUpstreamModels().catch(() => null);
-  const resolvedId = mapModel(requestedModel, upstreamModels?.ids ?? null);
+  const resolvedId = mapModel(applyModelOverride(requestedModel), upstreamModels?.ids ?? null);
   const modelInfo = upstreamModels?.byId?.get(resolvedId) ?? null;
 
   // Copilot 對 Claude 模型有原生 /v1/messages —— 直接轉發，不經 OpenAI 轉譯。
@@ -445,6 +459,8 @@ async function nativeCountTokens(req, resolvedId) {
 
 export {
   DEFAULT_THINKING_EFFORT,
+  DEFAULT_MODEL_OVERRIDE,
+  applyModelOverride,
   proxyRequest,
   anthropicRequest,
   callCopilot,

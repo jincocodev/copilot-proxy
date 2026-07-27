@@ -10,6 +10,7 @@ import {
   mapStopReason,
   resolveModel,
   classifyTier,
+  stripDateSuffix,
   flattenSystem,
   flattenToolResultContent,
   convertTools,
@@ -1049,5 +1050,24 @@ describe("AnthropicStreamTranslator — 中斷處理", () => {
     const names = parseSSE(out).map((e) => e.event);
     assert.equal(names[0], "message_start");
     assert.ok(names.includes("error"));
+  });
+});
+
+describe("stripDateSuffix — Claude Code 的變體後綴", () => {
+  test("[1m] 1M context 變體後綴要去掉", () => {
+    // Claude Code 的 /model 會存成 claude-fable-5[1m]
+    assert.equal(mapModel("claude-fable-5[1m]"), "claude-sonnet-4.5");
+    assert.equal(mapModel("claude-opus-4-8[1m]"), "claude-opus-4.8");
+  });
+
+  test("[1m] 加上即時清單也要對得到", () => {
+    const ids = ["claude-opus-4.8", "claude-sonnet-5", "claude-haiku-4.5"];
+    assert.equal(mapModel("claude-opus-5[1m]", ids), "claude-opus-4.8");
+    assert.equal(mapModel("claude-fable-5[1m]", ids), "claude-sonnet-5");
+  });
+
+  test("classifyTier 對帶後綴的也要分對", () => {
+    assert.equal(classifyTier(stripDateSuffix("claude-fable-5[1m]")), "sonnet");
+    assert.equal(classifyTier(stripDateSuffix("claude-haiku-4-5-20251001")), "haiku");
   });
 });

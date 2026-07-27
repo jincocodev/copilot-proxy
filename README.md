@@ -121,9 +121,26 @@ curl "http://localhost:3456/admin/model-map?model=claude-opus-5" -H "Authorizati
 ```
 
 > ⚠️ Claude Code 的 `/model` 只列官方模型名稱，選不到 Copilot 的短名 —— 你選 Fable 5
-> 或 Opus 5，實際跑的是上表對照後的模型。要指定確切的 Copilot id，用
-> `ANTHROPIC_MODEL` 環境變數（見 `claude-code.sh`），但 Claude Code 裡用 `/model`
-> 存過的預設會蓋掉環境變數。
+> 或 Opus 5，實際跑的是上表對照後的模型。
+
+#### 強制指定模型
+
+`ANTHROPIC_MODEL` 環境變數會被 Claude Code 裡 `/model` 存過的預設蓋掉
+（存在 `~/.claude.json`，格式像 `claude-fable-5[1m]`），所以要壓住它只能在 proxy 這邊：
+
+```bash
+echo 'COPILOT_DEFAULT_MODEL=claude-opus-4.8' >> .env
+docker compose up -d
+```
+
+不管 client 送什麼都會換成這個。**唯一的例外是 haiku 階** —— 那是 Claude Code 跑
+背景小任務（標題生成、指令偵測之類）用的，抬成 opus 只是浪費錢又沒有好處。
+
+log 會顯示原始要求與實際使用：
+
+```
+✅ [native] claude-fable-5[1m]→claude-opus-4.8 200 (8231ms) in=18 out=410 think=212
+```
 
 ### 思考程度（extended thinking）
 
@@ -348,6 +365,7 @@ Anthropic 的 opus 4.5/4.6/4.7/4.8、sonnet 4.5/4.6/5、haiku 4.5，
 | `PROXY_API_KEY` | (空) | API key，空 = 不驗證 |
 | `CREDENTIALS_PATH` | `.credentials.json` | GitHub token 儲存路徑 |
 | `COPILOT_THINKING_EFFORT` | (空) | 伺服器端預設思考檔位（`low`…`max`），空 = 由 client 決定 |
+| `COPILOT_DEFAULT_MODEL` | (空) | 伺服器端強制指定模型，壓過 client 送的（haiku 階除外） |
 
 ## 測試
 

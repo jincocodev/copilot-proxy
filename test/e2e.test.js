@@ -7,8 +7,14 @@ import { test, describe, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 
-// 必須在 import index.js 之前設好，index.js 在載入時就會讀
+// 必須在 import index.js 之前設好，index.js 在載入時就會讀。
+//
+// 這幾個也要明確清掉：index.js 會呼叫 dotenv config()，開發機的 .env 若設了
+// COPILOT_THINKING_EFFORT 就會滲進測試，讓「沒要求 thinking 時不該加參數」
+// 這類斷言隨開發機設定而變。dotenv 不覆蓋已存在的 key，所以設空字串就擋住了。
 process.env.PROXY_API_KEY = "test-key-123";
+process.env.COPILOT_THINKING_EFFORT = "";
+process.env.COPILOT_DEFAULT_MODEL = "";
 
 const { app } = await import("../index.js");
 const { state } = await import("../token-manager.js");
@@ -943,5 +949,25 @@ describe("CORS 與管理端點", () => {
     const json = await res.json();
     assert.equal(json.proxy.endpoints.anthropic, "/v1/messages");
     assert.equal(json.proxy.endpoints.openai, "/v1/chat/completions");
+  });
+});
+
+// ── 伺服器端強制指定模型 ──────────────────────────────────────
+// COPILOT_DEFAULT_MODEL 在載入時就讀進去了，所以這裡直接測那支純函式的規則
+describe("applyModelOverride 規則", () => {
+  test("沒設 override 時原樣回傳", async () => {
+    const { applyModelOverride } = await import("../proxy.js");
+    assert.equal(applyModelOverride("claude-fable-5"), "claude-fable-5");
+  });
+
+  test("haiku 階不被覆寫（背景小任務不該花 opus 的錢）", async () => {
+    const { classifyTier, stripDateSuffix } = await import("../anthropic-adapter.js");
+    // 規則本身：haiku 階要被辨識出來
+    assert.equal(classifyTier(stripDateSuffix("claude-3-5-haiku-20241022")), "haiku");
+    assert.equal(classifyTier(stripDateSuffix("claude-haiku-4.5")), "haiku");
+    // 非 haiku 階
+    for (const m of ["claude-fable-5[1m]", "claude-sonnet-5", "claude-opus-5"]) {
+      assert.notEqual(classifyTier(stripDateSuffix(m)), "haiku", m);
+    }
   });
 });

@@ -55,7 +55,7 @@ export ANTHROPIC_API_KEY="${PROXY_API_KEY:-not-needed}"
 # 這裡明確指定可以省掉一層猜測。
 # 這些必須是上游真的有的 id。claude-sonnet-4 已經下架，送過去只會拿到
 # 400 model_not_supported —— 查目前有什麼：curl /v1/models
-export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4.5}"
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-opus-4.8}"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-4.8}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-4.5}"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-haiku-4.5}"
