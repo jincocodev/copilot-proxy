@@ -7,31 +7,89 @@
 // Claude Code 會送出帶日期的完整 model id（claude-sonnet-4-5-20250929），
 // Copilot 只認短名（claude-sonnet-4.5）。這裡把常見的都對過去。
 
-const MODEL_MAP = {
-  // Claude 5 世代 — Copilot 都還沒有，對到同一階最好的可用款。
-  // Claude Code 的 /model 只列官方名稱，所以這幾條是實際會被打到的路徑。
-  "claude-opus-5": "claude-opus-4.6",
-  "claude-sonnet-5": "claude-sonnet-4.5",
-  "claude-fable-5": "claude-sonnet-4.5", // fable 是快速階，Copilot 無對應
-  // Opus
+// 上游拿不到清單時的靜態退路。這張表會過期 —— 正常路徑是
+// resolveModel() 依上游 GET /models 的即時清單挑，見下方。
+const FALLBACK_MODEL_MAP = {
+  "claude-opus-5": "claude-opus-4.8",
+  "claude-sonnet-5": "claude-sonnet-5",
+  "claude-fable-5": "claude-sonnet-4.5",
+  "claude-opus-4-8": "claude-opus-4.8",
+  "claude-opus-4-7": "claude-opus-4.7",
   "claude-opus-4-6": "claude-opus-4.6",
   "claude-opus-4-5": "claude-opus-4.5",
-  "claude-opus-4-1": "claude-opus-4.6",
+  "claude-opus-4-1": "claude-opus-4.5",
   "claude-opus-4": "claude-opus-4.5",
   "claude-3-opus": "claude-opus-4.5",
-  // Sonnet
+  "claude-sonnet-4-6": "claude-sonnet-4.6",
   "claude-sonnet-4-5": "claude-sonnet-4.5",
-  "claude-sonnet-4": "claude-sonnet-4",
-  "claude-3-7-sonnet": "claude-sonnet-4",
-  "claude-3-5-sonnet": "claude-sonnet-4",
-  // Haiku — Copilot 沒有 haiku，退到最便宜可用的 sonnet
-  "claude-3-5-haiku": "claude-sonnet-4",
-  "claude-haiku-4-5": "claude-sonnet-4",
-  "claude-3-haiku": "claude-sonnet-4",
+  // claude-sonnet-4 已經從 Copilot 下架，送過去會拿到
+  // 400 model_not_supported，所以要對到還活著的
+  "claude-sonnet-4": "claude-sonnet-4.5",
+  "claude-3-7-sonnet": "claude-sonnet-4.5",
+  "claude-3-5-sonnet": "claude-sonnet-4.5",
+  "claude-haiku-4-5": "claude-haiku-4.5",
+  "claude-3-5-haiku": "claude-haiku-4.5",
+  "claude-3-haiku": "claude-haiku-4.5",
 };
 
 // 已經警告過的 model，避免每個請求都刷一行
 const warnedModels = new Set();
+
+// ── 依上游即時清單解析 ──────────────────────────────────────
+// 硬寫對照表一定會過期（Copilot 下架 sonnet-4、加上 opus-4.7/4.8 就是實例）。
+// 這裡改成：先看上游有沒有一模一樣的，沒有就在同一階裡挑版號最高的。
+
+function classifyTier(base) {
+  if (base.includes("haiku")) return "haiku";
+  if (base.includes("opus")) return "opus";
+  if (base.includes("sonnet")) return "sonnet";
+  // fable 是快速階，Copilot 沒有對應，歸到 sonnet
+  if (base.includes("fable")) return "sonnet";
+  return null;
+}
+
+// claude-opus-4.8 → [4, 8]；claude-sonnet-5 → [5]
+function versionKey(id) {
+  const m = id.match(/(\d+(?:\.\d+)*)\s*$/);
+  if (!m) return [0];
+  return m[1].split(".").map(Number);
+}
+
+function compareVersion(a, b) {
+  const va = versionKey(a);
+  const vb = versionKey(b);
+  for (let i = 0; i < Math.max(va.length, vb.length); i++) {
+    const d = (vb[i] ?? 0) - (va[i] ?? 0);
+    if (d !== 0) return d; // 降冪
+  }
+  return 0;
+}
+
+// availableIds 為上游 GET /models 回來的 id 陣列
+function resolveModel(requested, availableIds) {
+  const available = new Set(availableIds);
+
+  // 1. 上游本來就有這個名字（含 claude-sonnet-5、claude-opus-4.6 這類短名）
+  if (available.has(requested)) return requested;
+
+  const base = stripDateSuffix(requested);
+  if (available.has(base)) return base;
+
+  // 2. 靜態表的目標還活著就用它
+  const mapped = FALLBACK_MODEL_MAP[base];
+  if (mapped && available.has(mapped)) return mapped;
+
+  // 3. 同一階裡挑版號最高的
+  const tier = classifyTier(base);
+  if (tier) {
+    const candidates = availableIds
+      .filter((id) => id.startsWith("claude-") && classifyTier(id) === tier)
+      .sort(compareVersion);
+    if (candidates.length > 0) return candidates[0];
+  }
+
+  return null; // 交給呼叫端決定預設
+}
 
 const DEFAULT_MODEL = "claude-sonnet-4.5";
 
@@ -40,29 +98,45 @@ function stripDateSuffix(model) {
   return model.replace(/-\d{8}$/, "").replace(/-latest$/, "");
 }
 
-function mapModel(anthropicModel) {
+// availableIds 有給就依即時清單解析，沒給就退回靜態表。
+function mapModel(anthropicModel, availableIds = null) {
   if (!anthropicModel) return DEFAULT_MODEL;
+
+  if (Array.isArray(availableIds) && availableIds.length > 0) {
+    const resolved = resolveModel(anthropicModel, availableIds);
+    if (resolved) {
+      warnIfDowngraded(anthropicModel, resolved);
+      return resolved;
+    }
+    // 非 claude 的（gpt-*/gemini-*）原樣送出，讓上游自己拒
+    if (!stripDateSuffix(anthropicModel).startsWith("claude-")) return anthropicModel;
+    warnIfDowngraded(anthropicModel, DEFAULT_MODEL);
+    return DEFAULT_MODEL;
+  }
+
+  // ── 以下是拿不到上游清單時的退路 ──
+
+  const base = stripDateSuffix(anthropicModel);
+  if (FALLBACK_MODEL_MAP[base]) return FALLBACK_MODEL_MAP[base];
 
   // 已經是 Copilot 短名（含小數點）就直接放行
   if (anthropicModel.includes(".")) return anthropicModel;
 
-  const base = stripDateSuffix(anthropicModel);
-  if (MODEL_MAP[base]) return MODEL_MAP[base];
-
-  // 未知的 claude-* 一律退到預設，其他（gpt-*/gemini-*）原樣送出。
-  // 這裡一定要出聲：使用者在 Claude Code 選了某個模型，實際跑的卻是別的，
-  // 沒有任何提示的話根本看不出來。
   if (base.startsWith("claude-")) {
-    if (!warnedModels.has(base)) {
-      warnedModels.add(base);
-      console.warn(
-        `⚠️  Copilot 沒有 ${anthropicModel}，退到 ${DEFAULT_MODEL}。` +
-          `可用清單見 GET /v1/models`
-      );
-    }
+    warnIfDowngraded(anthropicModel, DEFAULT_MODEL);
     return DEFAULT_MODEL;
   }
   return anthropicModel;
+}
+
+// 使用者在 Claude Code 選了某個模型、實際跑的卻是別的，沒有提示的話
+// 根本看不出來（實測就發生過：選 Fable 5 但跑 sonnet-4.5）。
+function warnIfDowngraded(requested, actual) {
+  if (requested === actual) return;
+  const key = `${requested}→${actual}`;
+  if (warnedModels.has(key)) return;
+  warnedModels.add(key);
+  console.warn(`⚠️  Copilot 沒有 ${requested}，改用 ${actual}。可用清單見 GET /v1/models`);
 }
 
 // ── Content block → OpenAI content ──────────────────────────
@@ -251,7 +325,7 @@ function convertToolChoice(toolChoice) {
 }
 
 // Anthropic Messages request → OpenAI Chat Completions request
-function anthropicToOpenAI(body) {
+function anthropicToOpenAI(body, availableIds = null) {
   const messages = [];
 
   const system = flattenSystem(body.system);
@@ -262,7 +336,7 @@ function anthropicToOpenAI(body) {
   }
 
   const openaiBody = {
-    model: mapModel(body.model),
+    model: mapModel(body.model, availableIds),
     messages,
     stream: body.stream === true,
   };
@@ -461,6 +535,9 @@ export {
   estimateTextTokens,
   anthropicError,
   mapModel,
+  resolveModel,
+  classifyTier,
+  FALLBACK_MODEL_MAP,
   mapStopReason,
   flattenSystem,
   flattenToolResultContent,

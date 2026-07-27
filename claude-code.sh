@@ -53,12 +53,13 @@ export ANTHROPIC_API_KEY="${PROXY_API_KEY:-not-needed}"
 
 # Copilot 的 model 短名。Claude Code 送完整名稱時 proxy 也會自動對照，
 # 這裡明確指定可以省掉一層猜測。
+# 這些必須是上游真的有的 id。claude-sonnet-4 已經下架，送過去只會拿到
+# 400 model_not_supported —— 查目前有什麼：curl /v1/models
 export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4.5}"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-4.6}"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-4.8}"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-4.5}"
-# Copilot 沒有 haiku，背景小任務也只能用 sonnet-4
-export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-sonnet-4}"
-export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-claude-sonnet-4}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-haiku-4.5}"
+export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-claude-haiku-4.5}"
 
 # 少打幾個非必要的端點（proxy 沒實作那些，關掉可以少一些雜訊）
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}"

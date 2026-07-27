@@ -16,10 +16,37 @@ const API_KEY = "test-key-123";
 let upstreamHandler = null;
 let lastUpstreamRequest = null;
 
+// 上游實測回來的模型清單（縮減版）
+const UPSTREAM_MODELS = [
+  ["claude-haiku-4.5", "Anthropic"],
+  ["claude-opus-4.5", "Anthropic"],
+  ["claude-opus-4.8", "Anthropic"],
+  ["claude-sonnet-4.5", "Anthropic"],
+  ["claude-sonnet-5", "Anthropic"],
+  ["gpt-4o", "Azure OpenAI"],
+].map(([id, vendor]) => ({
+  id,
+  vendor,
+  capabilities: {
+    limits: { max_context_window_tokens: 200000, max_output_tokens: 32000 },
+    supports: { tool_calls: true, vision: true, streaming: true },
+  },
+}));
+
+// 明明列在清單裡卻不給用的（模擬 claude-sonnet-4 下架）
+const UPSTREAM_REJECTS = new Set(["claude-sonnet-4"]);
+
 const upstream = http.createServer((req, res) => {
   let raw = "";
   req.on("data", (c) => (raw += c));
   req.on("end", () => {
+    // GET /models 是 proxy 自己去問的，不算「client 的請求」，
+    // 不要蓋掉 lastUpstreamRequest，否則斷言會看到錯的東西
+    if (req.url === "/models") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ data: UPSTREAM_MODELS }));
+    }
+
     let body = {};
     try {
       body = JSON.parse(raw || "{}");
@@ -27,6 +54,17 @@ const upstream = http.createServer((req, res) => {
       // 保留空物件
     }
     lastUpstreamRequest = { url: req.url, method: req.method, headers: req.headers, body };
+
+    // 送了清單上沒有的 model 就照真上游那樣回 400
+    if (body.model && UPSTREAM_REJECTS.has(body.model)) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(
+        JSON.stringify({
+          error: { message: "The requested model is not supported.", code: "model_not_supported" },
+        })
+      );
+    }
+
     upstreamHandler(req, res, lastUpstreamRequest);
   });
 });
@@ -592,6 +630,73 @@ describe("/v1/messages/count_tokens", () => {
       body: JSON.stringify({ model: "m", messages: [] }),
     });
     assert.equal(res.status, 401);
+  });
+});
+
+// ── 模型解析（走上游即時清單）────────────────────────────────
+
+describe("模型解析", () => {
+  test("/v1/models 回上游的真實清單，不是硬寫的", async () => {
+    const res = await fetch(`${baseUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    });
+    const json = await res.json();
+    const ids = json.data.map((m) => m.id);
+    assert.ok(ids.includes("claude-sonnet-5"), ids.join(","));
+    assert.ok(ids.includes("claude-haiku-4.5"), ids.join(","));
+    // 硬寫清單裡有但上游沒有的，不該出現
+    assert.ok(!ids.includes("claude-sonnet-4"), ids.join(","));
+  });
+
+  test("/v1/models 帶上 context window 等能力資訊", async () => {
+    const res = await fetch(`${baseUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    });
+    const m = (await res.json()).data.find((x) => x.id === "claude-sonnet-5");
+    assert.equal(m.context_window, 200000);
+    assert.equal(m.supports.tool_calls, true);
+    assert.equal(m.owned_by, "anthropic");
+  });
+
+  test("Claude Code 送 claude-sonnet-5 時原樣送上游（不再降級）", async () => {
+    await messagesRequest({ ...MINIMAL, model: "claude-sonnet-5" });
+    assert.equal(lastUpstreamRequest.body.model, "claude-sonnet-5");
+  });
+
+  test("claude-opus-5 對到上游最好的 opus", async () => {
+    await messagesRequest({ ...MINIMAL, model: "claude-opus-5" });
+    assert.equal(lastUpstreamRequest.body.model, "claude-opus-4.8");
+  });
+
+  test("已下架的 claude-sonnet-4 不會被原樣送出（否則上游回 400）", async () => {
+    const res = await messagesRequest({ ...MINIMAL, model: "claude-sonnet-4-20250514" });
+    assert.equal(res.status, 200, "應該成功，不該撞到 model_not_supported");
+    assert.equal(lastUpstreamRequest.body.model, "claude-sonnet-4.5");
+  });
+
+  test("haiku 對到上游真的有的 claude-haiku-4.5", async () => {
+    await messagesRequest({ ...MINIMAL, model: "claude-3-5-haiku-20241022" });
+    assert.equal(lastUpstreamRequest.body.model, "claude-haiku-4.5");
+  });
+
+  test("送上游的 model 一定在清單內", async () => {
+    const allowed = new Set(UPSTREAM_MODELS.map((m) => m.id));
+    for (const m of ["claude-opus-5", "claude-fable-5", "claude-sonnet-4-20250514", "claude-3-opus-20240229"]) {
+      await messagesRequest({ ...MINIMAL, model: m });
+      assert.ok(
+        allowed.has(lastUpstreamRequest.body.model),
+        `${m} → ${lastUpstreamRequest.body.model} 不在上游清單裡`
+      );
+    }
+  });
+
+  test("/admin/model-map 標示 live 並列出可用清單", async () => {
+    const res = await fetch(`${baseUrl}/admin/model-map`, {
+      headers: { authorization: `Bearer ${API_KEY}` },
+    });
+    const json = await res.json();
+    assert.equal(json.live, true);
+    assert.ok(json.available.includes("claude-sonnet-5"));
   });
 });
 

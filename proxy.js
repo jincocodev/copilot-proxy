@@ -32,6 +32,49 @@ function hasImageContent(body) {
   return false;
 }
 
+// ── 上游模型清單 ────────────────────────────────────────────
+// 硬寫清單會過期（實際踩過：Copilot 下架了 claude-sonnet-4，但我們還在送，
+// 每次都拿 400 model_not_supported）。改成問上游，快取 10 分鐘。
+
+const MODELS_CACHE_TTL_MS = 10 * 60 * 1000;
+let modelsCache = { ids: null, data: null, fetchedAt: 0, inFlight: null };
+
+async function fetchUpstreamModels() {
+  const copilotToken = await ensureCopilotToken();
+  const res = await fetch(`${state.apiBaseUrl}/models`, {
+    headers: buildHeaders(copilotToken),
+  });
+  if (!res.ok) throw new Error(`Upstream /models failed: HTTP ${res.status}`);
+  const json = await res.json();
+  const all = Array.isArray(json.data) ? json.data : [];
+
+  // 只留能對話的：embedding 之類的沒有 max_context_window_tokens
+  const chat = all.filter((m) => m?.id && m?.capabilities?.limits?.max_context_window_tokens);
+  return { ids: chat.map((m) => m.id), data: chat };
+}
+
+// 拿不到就回 null，呼叫端各自退回靜態行為
+async function getUpstreamModels() {
+  const fresh = Date.now() - modelsCache.fetchedAt < MODELS_CACHE_TTL_MS;
+  if (modelsCache.ids && fresh) return modelsCache;
+  if (modelsCache.inFlight) return modelsCache.inFlight;
+
+  modelsCache.inFlight = (async () => {
+    try {
+      const { ids, data } = await fetchUpstreamModels();
+      modelsCache = { ids, data, fetchedAt: Date.now(), inFlight: null };
+      return modelsCache;
+    } catch (err) {
+      console.error(`⚠️  取不到上游模型清單，改用靜態對照：${err.message}`);
+      modelsCache.inFlight = null;
+      // 有舊資料就繼續用舊的，別因為一次失敗就退化
+      return modelsCache.ids ? modelsCache : null;
+    }
+  })();
+
+  return modelsCache.inFlight;
+}
+
 // OpenAI 與 Anthropic 兩條路徑共用的上游呼叫
 async function callCopilot(openaiBody) {
   const copilotToken = await ensureCopilotToken();
@@ -129,9 +172,12 @@ async function anthropicRequest(req, res) {
     return { success: false };
   }
 
+  // 依上游即時清單挑模型，取不到清單就退回靜態對照
+  const upstreamModels = await getUpstreamModels().catch(() => null);
+
   let openaiBody;
   try {
-    openaiBody = anthropicToOpenAI(body);
+    openaiBody = anthropicToOpenAI(body, upstreamModels?.ids ?? null);
   } catch (err) {
     res.status(400).json(anthropicError(400, `Request translation failed: ${err.message}`));
     return { success: false };
@@ -212,4 +258,11 @@ async function streamAnthropic(upstream, res, { model, inputTokens, label, start
   }
 }
 
-export { proxyRequest, anthropicRequest, callCopilot, buildHeaders, hasImageContent };
+export {
+  proxyRequest,
+  anthropicRequest,
+  callCopilot,
+  buildHeaders,
+  hasImageContent,
+  getUpstreamModels,
+};

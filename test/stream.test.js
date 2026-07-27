@@ -8,6 +8,8 @@ import {
   estimateTokens,
   mapModel,
   mapStopReason,
+  resolveModel,
+  classifyTier,
   flattenSystem,
   flattenToolResultContent,
   convertTools,
@@ -49,27 +51,33 @@ function textChunk(content, finish = null) {
 
 // ── Model 對照 ───────────────────────────────────────────────
 
-describe("mapModel", () => {
+describe("mapModel — 靜態退路（拿不到上游清單時）", () => {
   test("Claude 5 世代對到同階最好的 Copilot 款", () => {
-    // Claude Code 的 /model 只列官方名稱，這幾條是實際會被打到的
-    assert.equal(mapModel("claude-opus-5"), "claude-opus-4.6");
-    assert.equal(mapModel("claude-sonnet-5"), "claude-sonnet-4.5");
+    assert.equal(mapModel("claude-opus-5"), "claude-opus-4.8");
+    assert.equal(mapModel("claude-sonnet-5"), "claude-sonnet-5");
     assert.equal(mapModel("claude-fable-5"), "claude-sonnet-4.5");
   });
 
   test("帶日期後綴的 opus 對到 Copilot 短名", () => {
     assert.equal(mapModel("claude-opus-4-5-20251101"), "claude-opus-4.5");
     assert.equal(mapModel("claude-opus-4-6-20260205"), "claude-opus-4.6");
+    assert.equal(mapModel("claude-opus-4-8-20260601"), "claude-opus-4.8");
   });
 
   test("帶日期後綴的 sonnet 對到 Copilot 短名", () => {
     assert.equal(mapModel("claude-sonnet-4-5-20250929"), "claude-sonnet-4.5");
-    assert.equal(mapModel("claude-sonnet-4-20250514"), "claude-sonnet-4");
+    assert.equal(mapModel("claude-sonnet-4-6-20260101"), "claude-sonnet-4.6");
   });
 
-  test("haiku 沒有上游對應，退到 sonnet-4", () => {
-    assert.equal(mapModel("claude-3-5-haiku-20241022"), "claude-sonnet-4");
-    assert.equal(mapModel("claude-haiku-4-5-20251001"), "claude-sonnet-4");
+  test("已下架的 claude-sonnet-4 不能原樣送出（會拿 400 model_not_supported）", () => {
+    const mapped = mapModel("claude-sonnet-4-20250514");
+    assert.notEqual(mapped, "claude-sonnet-4");
+    assert.equal(mapped, "claude-sonnet-4.5");
+  });
+
+  test("haiku 對到 Copilot 真的有的 claude-haiku-4.5", () => {
+    assert.equal(mapModel("claude-3-5-haiku-20241022"), "claude-haiku-4.5");
+    assert.equal(mapModel("claude-haiku-4-5-20251001"), "claude-haiku-4.5");
   });
 
   test("-latest 後綴也要處理", () => {
@@ -92,6 +100,99 @@ describe("mapModel", () => {
   test("空值退到預設", () => {
     assert.equal(mapModel(undefined), "claude-sonnet-4.5");
     assert.equal(mapModel(""), "claude-sonnet-4.5");
+  });
+});
+
+// 實測從 GitHub Copilot Business 上游拿到的清單
+const LIVE_IDS = [
+  "claude-haiku-4.5",
+  "claude-opus-4.5",
+  "claude-opus-4.6",
+  "claude-opus-4.7",
+  "claude-opus-4.8",
+  "claude-sonnet-4.5",
+  "claude-sonnet-4.6",
+  "claude-sonnet-5",
+  "gpt-4o",
+  "gpt-5.5",
+  "gemini-2.5-pro",
+];
+
+describe("mapModel — 依上游即時清單解析", () => {
+  test("上游有一模一樣的就用它", () => {
+    assert.equal(mapModel("claude-sonnet-5", LIVE_IDS), "claude-sonnet-5");
+    assert.equal(mapModel("claude-opus-4.7", LIVE_IDS), "claude-opus-4.7");
+  });
+
+  test("未知的 opus 挑同階版號最高的", () => {
+    assert.equal(mapModel("claude-opus-5", LIVE_IDS), "claude-opus-4.8");
+    assert.equal(mapModel("claude-opus-9-20990101", LIVE_IDS), "claude-opus-4.8");
+  });
+
+  test("未知的 sonnet 挑同階版號最高的", () => {
+    // 5 要大於 4.6，不能用字串比較
+    assert.equal(mapModel("claude-sonnet-9", LIVE_IDS), "claude-sonnet-5");
+  });
+
+  test("haiku 挑 haiku，不會跑到 sonnet 去", () => {
+    assert.equal(mapModel("claude-3-5-haiku-20241022", LIVE_IDS), "claude-haiku-4.5");
+  });
+
+  test("靜態表的目標還活著時優先用它，不會盲目升到同階最高", () => {
+    // fable 是快速階，對到 sonnet-4.5 比升到最貴的 sonnet-5 合理
+    assert.equal(mapModel("claude-fable-5", LIVE_IDS), "claude-sonnet-4.5");
+    assert.equal(mapModel("claude-3-opus-20240229", LIVE_IDS), "claude-opus-4.5");
+  });
+
+  test("靜態表的目標下架時才退到同階最高", () => {
+    // 清單裡故意沒有 claude-sonnet-4.5
+    const ids = ["claude-sonnet-4.6", "claude-sonnet-5", "claude-haiku-4.5"];
+    assert.equal(mapModel("claude-fable-5", ids), "claude-sonnet-5");
+  });
+
+  test("已下架的 sonnet-4 挑到活著的 sonnet", () => {
+    const mapped = mapModel("claude-sonnet-4-20250514", LIVE_IDS);
+    assert.ok(LIVE_IDS.includes(mapped));
+    assert.equal(mapped, "claude-sonnet-4.5");
+  });
+
+  test("解析結果一定在上游清單裡（絕不製造 400 model_not_supported）", () => {
+    const requests = [
+      "claude-opus-5",
+      "claude-sonnet-5",
+      "claude-fable-5",
+      "claude-opus-4-5-20251101",
+      "claude-sonnet-4-20250514",
+      "claude-3-5-haiku-20241022",
+      "claude-3-opus-20240229",
+      "claude-3-7-sonnet-20250219",
+    ];
+    for (const r of requests) {
+      const mapped = mapModel(r, LIVE_IDS);
+      assert.ok(LIVE_IDS.includes(mapped), `${r} → ${mapped} 不在上游清單裡`);
+    }
+  });
+
+  test("非 claude 的仍然原樣送出，讓上游自己拒", () => {
+    assert.equal(mapModel("gpt-5.9-unreleased", LIVE_IDS), "gpt-5.9-unreleased");
+  });
+
+  test("清單是空陣列時退回靜態行為", () => {
+    assert.equal(mapModel("claude-opus-5", []), "claude-opus-4.8");
+  });
+});
+
+describe("resolveModel", () => {
+  test("找不到同階的回 null，交給呼叫端決定", () => {
+    assert.equal(resolveModel("claude-haiku-4-5", ["gpt-4o"]), null);
+  });
+
+  test("classifyTier 分階正確", () => {
+    assert.equal(classifyTier("claude-opus-4.8"), "opus");
+    assert.equal(classifyTier("claude-sonnet-5"), "sonnet");
+    assert.equal(classifyTier("claude-haiku-4.5"), "haiku");
+    assert.equal(classifyTier("claude-fable-5"), "sonnet");
+    assert.equal(classifyTier("gpt-4o"), null);
   });
 });
 

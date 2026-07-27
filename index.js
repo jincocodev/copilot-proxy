@@ -10,7 +10,7 @@ import {
   startDeviceFlow,
   getStatus,
 } from "./token-manager.js";
-import { proxyRequest, anthropicRequest } from "./proxy.js";
+import { proxyRequest, anthropicRequest, getUpstreamModels } from "./proxy.js";
 import { estimateTokens, mapModel } from "./anthropic-adapter.js";
 
 const app = express();
@@ -103,30 +103,48 @@ function requireAuthAnthropic(req, res, next) {
 
 // --- OpenAI-compatible endpoints ---
 
-// 實測確認可用的模型（GitHub Copilot Business）
-const MODELS = [
-  // Anthropic
+// 取不到上游清單時的退路。這張表會過期，正常路徑是問上游。
+const FALLBACK_MODELS = [
+  { id: "claude-opus-4.8",          owned_by: "anthropic" },
   { id: "claude-opus-4.6",          owned_by: "anthropic" },
-  { id: "claude-opus-4.5",          owned_by: "anthropic" },
+  { id: "claude-sonnet-5",          owned_by: "anthropic" },
   { id: "claude-sonnet-4.5",        owned_by: "anthropic" },
-  { id: "claude-sonnet-4",          owned_by: "anthropic" },
-  // OpenAI
+  { id: "claude-haiku-4.5",         owned_by: "anthropic" },
   { id: "gpt-4o",                   owned_by: "openai" },
-  { id: "gpt-4o-mini",              owned_by: "openai" },
-  { id: "gpt-4",                    owned_by: "openai" },
   { id: "gpt-4.1",                  owned_by: "openai" },
-  // Google
   { id: "gemini-2.5-pro",           owned_by: "google" },
-  { id: "gemini-3-flash-preview",   owned_by: "google" },
 ];
 
-app.get("/v1/models", apiKeyAuth, requireAuth, (req, res) => {
+app.get("/v1/models", apiKeyAuth, requireAuth, async (req, res) => {
+  const created = Math.floor(Date.now() / 1000);
+  const upstream = await getUpstreamModels().catch(() => null);
+
+  if (upstream?.data) {
+    return res.json({
+      object: "list",
+      data: upstream.data.map((m) => ({
+        id: m.id,
+        object: "model",
+        created,
+        owned_by: (m.vendor || "unknown").toLowerCase(),
+        // 額外資訊，OpenAI 規格沒有但很好用（挑模型時看得到上下文長度）
+        context_window: m.capabilities?.limits?.max_context_window_tokens,
+        max_output_tokens: m.capabilities?.limits?.max_output_tokens,
+        supports: {
+          tool_calls: !!m.capabilities?.supports?.tool_calls,
+          vision: !!m.capabilities?.supports?.vision,
+          streaming: !!m.capabilities?.supports?.streaming,
+        },
+      })),
+    });
+  }
+
   res.json({
     object: "list",
-    data: MODELS.map((m) => ({
+    data: FALLBACK_MODELS.map((m) => ({
       id: m.id,
       object: "model",
-      created: Math.floor(Date.now() / 1000),
+      created,
       owned_by: m.owned_by,
     })),
   });
@@ -209,16 +227,23 @@ app.post("/admin/auth", apiKeyAuth, async (req, res) => {
 });
 
 // 檢查 Claude Code 的 model 名稱會被對到哪個 Copilot model
-app.get("/admin/model-map", apiKeyAuth, (req, res) => {
+app.get("/admin/model-map", apiKeyAuth, async (req, res) => {
+  const upstream = await getUpstreamModels().catch(() => null);
+  const ids = upstream?.ids ?? null;
   const probe = req.query.model;
-  if (probe) return res.json({ requested: probe, mapped: mapModel(probe) });
+  if (probe) {
+    return res.json({ requested: probe, mapped: mapModel(probe, ids), live: !!ids });
+  }
   res.json({
+    live: !!ids,
+    available: ids,
     examples: [
-      "claude-opus-4-6-20260205",
-      "claude-opus-4-5-20251101",
-      "claude-sonnet-4-5-20250929",
+      "claude-opus-5",
+      "claude-sonnet-5",
+      "claude-fable-5",
+      "claude-sonnet-4-20250514",
       "claude-3-5-haiku-20241022",
-    ].map((m) => ({ requested: m, mapped: mapModel(m) })),
+    ].map((m) => ({ requested: m, mapped: mapModel(m, ids) })),
   });
 });
 

@@ -72,40 +72,52 @@ curl -X POST http://localhost:3456/admin/auth \
 export ANTHROPIC_BASE_URL=http://localhost:3456
 export ANTHROPIC_API_KEY=YOUR_PROXY_API_KEY
 export ANTHROPIC_MODEL=claude-sonnet-4.5
-export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4.6
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-sonnet-4
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4.8
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-4.5
 claude
 ```
 
+> 這些必須是上游真的有的 id。先跑一次 `curl /v1/models` 確認，
+> 送不存在的會拿到 `400 model_not_supported`。
+
 ### Model 名稱對照
 
-Claude Code 會送出帶日期的完整 model id，proxy 自動對照到 Copilot 的短名：
+Copilot 的模型清單會變（實測就遇到 `claude-sonnet-4` 被下架、多出 `claude-opus-4.7`／`4.8`），
+所以 proxy 不硬寫清單 —— 每次啟動去問上游 `GET /models`，快取 10 分鐘。解析順序：
 
-| Claude Code 送出 | 對到 Copilot |
+1. 上游清單裡有一模一樣的 id → 直接用（`claude-sonnet-5`、`claude-opus-4.7` 走這條）
+2. 去掉日期後綴後有對應的靜態對照、且目標還活著 → 用它
+3. 同一階（opus／sonnet／haiku）裡挑版號最高的 → 版號用數值比較，`5` > `4.6`
+4. 都不行 → `claude-sonnet-4.5`
+
+實測結果（GitHub Copilot Business，2026-07）：
+
+| Claude Code 送出 | 實際跑 |
 |---|---|
-| `claude-opus-5` | `claude-opus-4.6` |
-| `claude-sonnet-5` | `claude-sonnet-4.5` |
-| `claude-fable-5` | `claude-sonnet-4.5`（Copilot 沒有 fable） |
-| `claude-opus-4-6-*` | `claude-opus-4.6` |
-| `claude-opus-4-5-*` | `claude-opus-4.5` |
-| `claude-sonnet-4-5-*` | `claude-sonnet-4.5` |
-| `claude-sonnet-4-*` | `claude-sonnet-4` |
-| `claude-3-5-haiku-*`、`claude-haiku-4-5-*` | `claude-sonnet-4`（Copilot 沒有 haiku） |
-| 其他未知的 `claude-*` | `claude-sonnet-4.5`，並在 log 留一行警告 |
+| `claude-opus-5` | `claude-opus-4.8` |
+| `claude-sonnet-5` | `claude-sonnet-5`（上游真的有） |
+| `claude-fable-5` | `claude-sonnet-4.5` |
+| `claude-sonnet-4-*` | `claude-sonnet-4.5`（sonnet-4 已下架） |
+| `claude-3-5-haiku-*` | `claude-haiku-4.5`（上游真的有 haiku） |
 
-> ⚠️ Claude Code 的 `/model` 只會列官方模型名稱，選不到 Copilot 的短名。所以你在
-> 那邊選 Fable 5 或 Opus 5，實際跑的是上表對照後的 Copilot 模型。每次請求的 log
-> 都會印 `requested→mapped`，想確認就看 `docker compose logs -f`。
->
-> 要指定 Copilot 短名，用 `ANTHROPIC_MODEL` 環境變數（見 `claude-code.sh`），
-> 但注意 Claude Code 裡用 `/model` 存過的預設會蓋掉環境變數。
+換模型時 log 會留一行警告，每個組合只印一次：
 
-查對照結果：
+```
+⚠️  Copilot 沒有 claude-opus-5，改用 claude-opus-4.8。可用清單見 GET /v1/models
+✅ [anthropic] claude-opus-5→claude-opus-4.8 200 (6376ms)
+```
+
+查目前上游有什麼、以及某個名稱會被對到哪：
 
 ```bash
-curl "http://localhost:3456/admin/model-map?model=claude-sonnet-4-5-20250929" \
-  -H "Authorization: Bearer YOUR_PROXY_API_KEY"
+curl http://localhost:3456/v1/models -H "Authorization: Bearer YOUR_PROXY_API_KEY"
+curl "http://localhost:3456/admin/model-map?model=claude-opus-5" -H "Authorization: Bearer YOUR_PROXY_API_KEY"
 ```
+
+> ⚠️ Claude Code 的 `/model` 只列官方模型名稱，選不到 Copilot 的短名 —— 你選 Fable 5
+> 或 Opus 5，實際跑的是上表對照後的模型。要指定確切的 Copilot id，用
+> `ANTHROPIC_MODEL` 環境變數（見 `claude-code.sh`），但 Claude Code 裡用 `/model`
+> 存過的預設會蓋掉環境變數。
 
 ### Copilot 上游缺的能力
 
@@ -205,11 +217,18 @@ Anthropic 端點多收 `x-api-key` 是因為 Claude Code 設 `ANTHROPIC_API_KEY`
 
 ## 可用模型
 
-| Provider | Models |
-|----------|--------|
-| Anthropic | claude-opus-4.6, claude-opus-4.5, claude-sonnet-4.5, claude-sonnet-4 |
-| OpenAI | gpt-4o, gpt-4o-mini, gpt-4, gpt-4.1 |
-| Google | gemini-2.5-pro, gemini-3-flash-preview |
+清單由上游決定、會變動，所以不寫死在文件裡。**查目前實際可用的：**
+
+```bash
+curl http://localhost:3456/v1/models -H "Authorization: Bearer YOUR_PROXY_API_KEY"
+```
+
+回應含每個模型的 `context_window`、`max_output_tokens`，以及是否支援
+`tool_calls`／`vision`／`streaming`。
+
+參考：2026-07 在 GitHub Copilot Business 上實測到 33 個可對話模型 ——
+Anthropic 的 opus 4.5/4.6/4.7/4.8、sonnet 4.5/4.6/5、haiku 4.5，
+另有 `gpt-5.x`、`gemini-3.1-pro-preview` 等。`claude-sonnet-4` 已不在清單內。
 
 ## Xcode 26 Intelligence 設定
 
