@@ -5,9 +5,25 @@
 - `/v1/chat/completions` — OpenAI 相容（Dify、Xcode Intelligence、OpenAI SDK…）
 - `/v1/messages` — Anthropic Messages（**Claude Code**、Anthropic SDK）
 
-Claude 模型走 **passthrough**：Copilot 對它們開了原生 `/v1/messages`，所以直接轉發，
-extended thinking、prompt caching、精確 token 計數都拿得到。gpt / gemini 只有
-`/chat/completions`，那條路才需要協議轉譯。
+## 這是什麼、為什麼要用
+
+你付錢訂了 **GitHub Copilot**，它裡面能用 Claude、GPT、Gemini 一堆好模型 —— 但正常情況下這些模型只能在 VS Code 之類「官方認可的編輯器」裡用，其他工具碰不到。
+
+這個 proxy 就是中間人：它拿你的 Copilot 帳號去跟上游要模型，再對外裝成兩種**業界標準的 API 介面**（OpenAI 版 + Anthropic 版）。於是任何講這兩種介面的工具 —— Claude Code、Dify、Xcode —— 都能接上來，等於**用一份 Copilot 訂閱餵飽所有 AI 工具**，不必再各自買 API 額度。
+
+> Claude 模型走 **passthrough**（直通）：Copilot 對它們開了原生 `/v1/messages`，所以原封不動轉發，extended thinking、prompt caching、精確 token 計數全都拿得到。gpt / gemini 只有 `/chat/completions`，那條路才需要把格式翻譯過去。
+
+## 前置需求
+
+跑之前先確認這三樣有了：
+
+| 需要 | 怎麼確認 / 取得 |
+|---|---|
+| **GitHub Copilot 訂閱**（核心前提） | 個人版或商業版都行，帳號要能正常用 Copilot。沒訂閱這個 proxy 完全無法運作 —— 它本身不含任何模型，只是借你的 Copilot 額度。到 [github.com/settings/copilot](https://github.com/settings/copilot) 看有沒有開通 |
+| **Docker Desktop**（推薦跑法） | 官網下載安裝 [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop)，裝完打開，選單列有鯨魚圖示代表在跑。終端機打 `docker --version` 有版本號就 OK |
+| **Claude Code**（若要拿來跑 Claude Code） | 只有搭 Claude Code 用才需要。安裝方式見 [官方文件](https://docs.claude.com/en/docs/claude-code)。純當 API 給 Dify／Xcode 用的話不需要 |
+
+> 授權階段會走 **GitHub device flow**：proxy 給你一組代碼，你到 GitHub 網頁貼上、按同意，就把你的 Copilot 授權給這個 proxy。全程不會碰到你的 GitHub 密碼。
 
 ## 快速開始（Docker，推薦）
 
