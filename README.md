@@ -217,7 +217,7 @@ docker compose logs -f --tail 0     # 有 client 要求 thinking=... 就是 clie
 | 功能 | 狀況 |
 |---|---|
 | Extended thinking | ✅ 支援，見上節 |
-| Prompt caching | ✅ `cache_control` 原樣轉發，usage 回報 `cache_read_input_tokens`／`cache_creation_input_tokens`（快取有 1024 token 最低門檻） |
+| Prompt caching | ✅ `cache_control` 原樣轉發。實測同一個 2284 token 的 system prompt 連送兩次：第一次 `cache_creation_input_tokens=2284`，第二次 `cache_read_input_tokens=2284`（快取有 1024 token 最低門檻，低於門檻不會觸發） |
 | Token 計數 | ✅ 用上游原生 `count_tokens`，回真值 |
 | 圖片輸入 | ✅ |
 | 工具呼叫 / 串流 | ✅ |
