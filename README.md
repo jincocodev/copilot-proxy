@@ -83,12 +83,22 @@ Claude Code 會送出帶日期的完整 model id，proxy 自動對照到 Copilot
 
 | Claude Code 送出 | 對到 Copilot |
 |---|---|
+| `claude-opus-5` | `claude-opus-4.6` |
+| `claude-sonnet-5` | `claude-sonnet-4.5` |
+| `claude-fable-5` | `claude-sonnet-4.5`（Copilot 沒有 fable） |
 | `claude-opus-4-6-*` | `claude-opus-4.6` |
 | `claude-opus-4-5-*` | `claude-opus-4.5` |
 | `claude-sonnet-4-5-*` | `claude-sonnet-4.5` |
 | `claude-sonnet-4-*` | `claude-sonnet-4` |
 | `claude-3-5-haiku-*`、`claude-haiku-4-5-*` | `claude-sonnet-4`（Copilot 沒有 haiku） |
-| 其他未知的 `claude-*` | `claude-sonnet-4.5` |
+| 其他未知的 `claude-*` | `claude-sonnet-4.5`，並在 log 留一行警告 |
+
+> ⚠️ Claude Code 的 `/model` 只會列官方模型名稱，選不到 Copilot 的短名。所以你在
+> 那邊選 Fable 5 或 Opus 5，實際跑的是上表對照後的 Copilot 模型。每次請求的 log
+> 都會印 `requested→mapped`，想確認就看 `docker compose logs -f`。
+>
+> 要指定 Copilot 短名，用 `ANTHROPIC_MODEL` 環境變數（見 `claude-code.sh`），
+> 但注意 Claude Code 裡用 `/model` 存過的預設會蓋掉環境變數。
 
 查對照結果：
 

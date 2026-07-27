@@ -50,6 +50,13 @@ function textChunk(content, finish = null) {
 // ── Model 對照 ───────────────────────────────────────────────
 
 describe("mapModel", () => {
+  test("Claude 5 世代對到同階最好的 Copilot 款", () => {
+    // Claude Code 的 /model 只列官方名稱，這幾條是實際會被打到的
+    assert.equal(mapModel("claude-opus-5"), "claude-opus-4.6");
+    assert.equal(mapModel("claude-sonnet-5"), "claude-sonnet-4.5");
+    assert.equal(mapModel("claude-fable-5"), "claude-sonnet-4.5");
+  });
+
   test("帶日期後綴的 opus 對到 Copilot 短名", () => {
     assert.equal(mapModel("claude-opus-4-5-20251101"), "claude-opus-4.5");
     assert.equal(mapModel("claude-opus-4-6-20260205"), "claude-opus-4.6");

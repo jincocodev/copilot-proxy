@@ -8,6 +8,11 @@
 // Copilot 只認短名（claude-sonnet-4.5）。這裡把常見的都對過去。
 
 const MODEL_MAP = {
+  // Claude 5 世代 — Copilot 都還沒有，對到同一階最好的可用款。
+  // Claude Code 的 /model 只列官方名稱，所以這幾條是實際會被打到的路徑。
+  "claude-opus-5": "claude-opus-4.6",
+  "claude-sonnet-5": "claude-sonnet-4.5",
+  "claude-fable-5": "claude-sonnet-4.5", // fable 是快速階，Copilot 無對應
   // Opus
   "claude-opus-4-6": "claude-opus-4.6",
   "claude-opus-4-5": "claude-opus-4.5",
@@ -25,6 +30,9 @@ const MODEL_MAP = {
   "claude-3-haiku": "claude-sonnet-4",
 };
 
+// 已經警告過的 model，避免每個請求都刷一行
+const warnedModels = new Set();
+
 const DEFAULT_MODEL = "claude-sonnet-4.5";
 
 // 去掉尾端日期後綴：claude-sonnet-4-5-20250929 → claude-sonnet-4-5
@@ -41,8 +49,19 @@ function mapModel(anthropicModel) {
   const base = stripDateSuffix(anthropicModel);
   if (MODEL_MAP[base]) return MODEL_MAP[base];
 
-  // 未知的 claude-* 一律退到預設，其他（gpt-*/gemini-*）原樣送出
-  if (base.startsWith("claude-")) return DEFAULT_MODEL;
+  // 未知的 claude-* 一律退到預設，其他（gpt-*/gemini-*）原樣送出。
+  // 這裡一定要出聲：使用者在 Claude Code 選了某個模型，實際跑的卻是別的，
+  // 沒有任何提示的話根本看不出來。
+  if (base.startsWith("claude-")) {
+    if (!warnedModels.has(base)) {
+      warnedModels.add(base);
+      console.warn(
+        `⚠️  Copilot 沒有 ${anthropicModel}，退到 ${DEFAULT_MODEL}。` +
+          `可用清單見 GET /v1/models`
+      );
+    }
+    return DEFAULT_MODEL;
+  }
   return anthropicModel;
 }
 
