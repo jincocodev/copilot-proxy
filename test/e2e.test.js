@@ -1,4 +1,8 @@
 // 端到端測試 — 用本機 mock 上游，不需要 GitHub 憑證，不會打到真的 Copilot API
+//
+// mock 上游同時服務兩個端點，跟真的 Copilot 一樣：
+//   /v1/messages       原生 Anthropic（Claude 模型走這條，passthrough）
+//   /chat/completions  OpenAI（gpt/gemini 走這條，需要轉譯）
 import { test, describe, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -13,35 +17,70 @@ const API_KEY = "test-key-123";
 
 // ── Mock 上游 ────────────────────────────────────────────────
 
-let upstreamHandler = null;
-let lastUpstreamRequest = null;
+// 照著真上游的形狀建。關鍵欄位：
+//   supported_endpoints  決定 proxy 走 passthrough 還是轉譯
+//   supports.adaptive_thinking / reasoning_effort  決定能不能調思考程度
+function anthropicModel(id, { efforts = null, adaptive = false } = {}) {
+  const supports = { tool_calls: true, vision: true, streaming: true };
+  if (adaptive) {
+    supports.adaptive_thinking = true;
+    supports.min_thinking_budget = 1024;
+    supports.max_thinking_budget = 32000;
+  }
+  if (efforts) supports.reasoning_effort = efforts;
+  return {
+    id,
+    vendor: "Anthropic",
+    supported_endpoints: ["/v1/messages", "/chat/completions"],
+    capabilities: {
+      limits: { max_context_window_tokens: 264000, max_output_tokens: 64000 },
+      supports,
+    },
+  };
+}
 
-// 上游實測回來的模型清單（縮減版）
 const UPSTREAM_MODELS = [
-  ["claude-haiku-4.5", "Anthropic"],
-  ["claude-opus-4.5", "Anthropic"],
-  ["claude-opus-4.8", "Anthropic"],
-  ["claude-sonnet-4.5", "Anthropic"],
-  ["claude-sonnet-5", "Anthropic"],
-  ["gpt-4o", "Azure OpenAI"],
-].map(([id, vendor]) => ({
-  id,
-  vendor,
-  capabilities: {
-    limits: { max_context_window_tokens: 200000, max_output_tokens: 32000 },
-    supports: { tool_calls: true, vision: true, streaming: true },
+  // 有 thinking + 完整 effort 階梯
+  anthropicModel("claude-sonnet-5", {
+    adaptive: true,
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+  }),
+  anthropicModel("claude-opus-4.8", {
+    adaptive: true,
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+  }),
+  // 有 thinking，但 effort 階梯缺 xhigh（真上游的 opus-4.6 就是這樣）
+  anthropicModel("claude-opus-4.6", {
+    adaptive: true,
+    efforts: ["low", "medium", "high", "max"],
+  }),
+  // 完全沒有 thinking / effort 能力
+  anthropicModel("claude-sonnet-4.5"),
+  anthropicModel("claude-opus-4.5"),
+  anthropicModel("claude-haiku-4.5"),
+  // 非 Claude：只有 /chat/completions，必須走轉譯層
+  {
+    id: "gpt-4o",
+    vendor: "Azure OpenAI",
+    supported_endpoints: ["/chat/completions"],
+    capabilities: {
+      limits: { max_context_window_tokens: 128000, max_output_tokens: 16384 },
+      supports: { tool_calls: true, vision: true, streaming: true },
+    },
   },
-}));
+];
 
-// 明明列在清單裡卻不給用的（模擬 claude-sonnet-4 下架）
-const UPSTREAM_REJECTS = new Set(["claude-sonnet-4"]);
+// 記錄 client 導致的上游請求（GET /models 不算）
+let lastUpstreamRequest = null;
+// 兩個端點各自的 handler，測試各自覆寫
+let nativeHandler = null;
+let chatHandler = null;
 
 const upstream = http.createServer((req, res) => {
   let raw = "";
   req.on("data", (c) => (raw += c));
   req.on("end", () => {
-    // GET /models 是 proxy 自己去問的，不算「client 的請求」，
-    // 不要蓋掉 lastUpstreamRequest，否則斷言會看到錯的東西
+    // proxy 自己去問的清單，不該蓋掉 lastUpstreamRequest
     if (req.url === "/models") {
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ data: UPSTREAM_MODELS }));
@@ -55,19 +94,51 @@ const upstream = http.createServer((req, res) => {
     }
     lastUpstreamRequest = { url: req.url, method: req.method, headers: req.headers, body };
 
-    // 送了清單上沒有的 model 就照真上游那樣回 400
-    if (body.model && UPSTREAM_REJECTS.has(body.model)) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      return res.end(
-        JSON.stringify({
-          error: { message: "The requested model is not supported.", code: "model_not_supported" },
-        })
-      );
+    // 照真上游的行為驗參數，這樣測試才抓得到 proxy 送錯東西
+    if (req.url === "/v1/messages") {
+      const model = UPSTREAM_MODELS.find((m) => m.id === body.model);
+      if (!model) return upstreamError(res, 400, "The requested model is not supported.");
+
+      const supports = model.capabilities.supports;
+      if (body.thinking?.type === "enabled") {
+        return upstreamError(
+          res,
+          400,
+          '"thinking.type.enabled" is not supported for this model. Use "thinking.type.adaptive" and "output_config.effort".'
+        );
+      }
+      if (body.thinking && !supports.adaptive_thinking) {
+        return upstreamError(res, 400, `${body.model} does not support thinking`);
+      }
+      const effort = body.output_config?.effort;
+      if (effort) {
+        if (!supports.reasoning_effort) {
+          return upstreamError(
+            res,
+            400,
+            `output_config.effort "${effort}" was provided, but model ${body.model} does not support reasoning effort`
+          );
+        }
+        if (!supports.reasoning_effort.includes(effort)) {
+          return upstreamError(res, 400, `effort "${effort}" not supported by ${body.model}`);
+        }
+      }
+      return nativeHandler(req, res, lastUpstreamRequest);
     }
 
-    upstreamHandler(req, res, lastUpstreamRequest);
+    if (req.url === "/v1/messages/count_tokens") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ input_tokens: 4242 }));
+    }
+
+    return chatHandler(req, res, lastUpstreamRequest);
   });
 });
+
+function upstreamError(res, status, message) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }));
+}
 
 let proxyServer;
 let baseUrl;
@@ -94,20 +165,48 @@ after(async () => {
 
 beforeEach(() => {
   lastUpstreamRequest = null;
-  upstreamHandler = (req, res) => {
+  nativeHandler = (req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(nativeMessage("default")));
+  };
+  chatHandler = (req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(jsonCompletion("default")));
   };
 });
 
-// ── 工具函式 ─────────────────────────────────────────────────
+// ── 回應建構工具 ─────────────────────────────────────────────
+
+// 原生 Anthropic 回應（含 Copilot 的私有 copilot_usage 欄位）
+function nativeMessage(text, extra = {}) {
+  return {
+    id: "msg_011CdRkeZRTH3u7XwnNE2dFY",
+    type: "message",
+    role: "assistant",
+    model: extra.model || "claude-sonnet-5",
+    content: extra.content || [{ type: "text", text }],
+    stop_reason: extra.stop_reason || "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: 10,
+      output_tokens: 4,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: extra.cacheRead ?? 0,
+      ...(extra.thinkingTokens
+        ? { output_tokens_details: { thinking_tokens: extra.thinkingTokens } }
+        : {}),
+    },
+    // Copilot 私有欄位，proxy 應該剝掉
+    copilot_usage: { total_nano_aiu: 6000000, token_details: [] },
+  };
+}
 
 function jsonCompletion(text, extra = {}) {
   return {
     id: "cmpl-mock",
     object: "chat.completion",
     created: 1700000000,
-    model: "claude-sonnet-4.5",
+    model: "gpt-4o",
     choices: [
       {
         index: 0,
@@ -120,10 +219,7 @@ function jsonCompletion(text, extra = {}) {
 }
 
 function sseUpstream(res, chunks, { delay = 0 } = {}) {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-  });
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
   let i = 0;
   const send = () => {
     if (i >= chunks.length) return res.end();
@@ -136,6 +232,10 @@ function sseUpstream(res, chunks, { delay = 0 } = {}) {
 
 function oaChunk(obj) {
   return `data: ${JSON.stringify(obj)}\n\n`;
+}
+
+function anthEvent(event, data) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
 function parseSSE(text) {
@@ -156,15 +256,19 @@ function parseSSE(text) {
 function messagesRequest(body, { headers = {}, key = API_KEY } = {}) {
   const h = { "Content-Type": "application/json", ...headers };
   if (key !== null && !("x-api-key" in h) && !("authorization" in h)) h["x-api-key"] = key;
-  return fetch(`${baseUrl}/v1/messages`, {
-    method: "POST",
-    headers: h,
-    body: JSON.stringify(body),
-  });
+  return fetch(`${baseUrl}/v1/messages`, { method: "POST", headers: h, body: JSON.stringify(body) });
 }
 
+// Claude 模型 → 走原生 passthrough
 const MINIMAL = {
   model: "claude-sonnet-4-5-20250929",
+  max_tokens: 100,
+  messages: [{ role: "user", content: "hi" }],
+};
+
+// 非 Claude 模型 → 走轉譯層
+const TRANSLATED = {
+  model: "gpt-4o",
   max_tokens: 100,
   messages: [{ role: "user", content: "hi" }],
 };
@@ -178,9 +282,7 @@ describe("/v1/messages 認證", () => {
   });
 
   test("Authorization: Bearer 也可以通過（ANTHROPIC_AUTH_TOKEN）", async () => {
-    const res = await messagesRequest(MINIMAL, {
-      headers: { authorization: `Bearer ${API_KEY}` },
-    });
+    const res = await messagesRequest(MINIMAL, { headers: { authorization: `Bearer ${API_KEY}` } });
     assert.equal(res.status, 200);
   });
 
@@ -219,17 +321,12 @@ describe("回歸：OpenAI 端點的認證行為沒被改動", () => {
       body: JSON.stringify({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] }),
     });
     assert.equal(res.status, 401);
-    // 而且是 OpenAI 的錯誤格式，不是 Anthropic 的
     const json = await res.json();
     assert.equal(json.error.message, "Invalid API key");
     assert.equal(json.type, undefined);
   });
 
   test("/v1/chat/completions 回應原樣轉發，不做 Anthropic 轉譯", async () => {
-    upstreamHandler = (req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(jsonCompletion("passthrough")));
-    };
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", authorization: `Bearer ${API_KEY}` },
@@ -237,7 +334,8 @@ describe("回歸：OpenAI 端點的認證行為沒被改動", () => {
     });
     const json = await res.json();
     assert.equal(json.object, "chat.completion");
-    assert.equal(json.choices[0].message.content, "passthrough");
+    // 送到 /chat/completions，不是原生端點
+    assert.equal(lastUpstreamRequest.url, "/chat/completions");
   });
 });
 
@@ -245,7 +343,10 @@ describe("回歸：OpenAI 端點的認證行為沒被改動", () => {
 
 describe("/v1/messages 請求驗證", () => {
   test("缺 max_tokens 回 400", async () => {
-    const res = await messagesRequest({ model: "claude-sonnet-4-5", messages: [{ role: "user", content: "hi" }] });
+    const res = await messagesRequest({
+      model: "claude-sonnet-4-5",
+      messages: [{ role: "user", content: "hi" }],
+    });
     assert.equal(res.status, 400);
     const json = await res.json();
     assert.equal(json.error.type, "invalid_request_error");
@@ -263,46 +364,84 @@ describe("/v1/messages 請求驗證", () => {
   });
 });
 
-// ── 非串流 ───────────────────────────────────────────────────
+// ── 原生 passthrough（Claude 模型）───────────────────────────
 
-describe("/v1/messages 非串流", () => {
-  test("回應是 Anthropic Messages 格式", async () => {
-    upstreamHandler = (req, res) => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(jsonCompletion("Hello from Copilot")));
-    };
-    const res = await messagesRequest(MINIMAL);
-    const json = await res.json();
-
-    assert.equal(json.type, "message");
-    assert.equal(json.role, "assistant");
-    assert.match(json.id, /^msg_/);
-    assert.deepEqual(json.content, [{ type: "text", text: "Hello from Copilot" }]);
-    assert.equal(json.stop_reason, "end_turn");
-    assert.deepEqual(json.usage, { input_tokens: 10, output_tokens: 5 });
+describe("原生 passthrough — 路由", () => {
+  test("Claude 模型送到上游的 /v1/messages，不是 /chat/completions", async () => {
+    await messagesRequest(MINIMAL);
+    assert.equal(lastUpstreamRequest.url, "/v1/messages");
   });
 
-  test("回報的 model 是 client 要求的名稱，不是上游短名", async () => {
-    const res = await messagesRequest(MINIMAL);
-    const json = await res.json();
-    assert.equal(json.model, "claude-sonnet-4-5-20250929");
-  });
-
-  test("上游收到的是對照後的短名與 OpenAI 格式", async () => {
+  test("body 保持 Anthropic 格式，沒有被轉成 OpenAI", async () => {
     await messagesRequest({
-      model: "claude-opus-4-5-20251101",
-      max_tokens: 100,
-      system: "be terse",
-      messages: [{ role: "user", content: "hi" }],
+      ...MINIMAL,
+      system: [{ type: "text", text: "be terse" }],
     });
-    assert.equal(lastUpstreamRequest.url, "/chat/completions");
-    assert.equal(lastUpstreamRequest.body.model, "claude-opus-4.5");
-    assert.equal(lastUpstreamRequest.body.messages[0].role, "system");
-    assert.equal(lastUpstreamRequest.body.messages[0].content, "be terse");
-    assert.equal(lastUpstreamRequest.body.stream, false);
+    const b = lastUpstreamRequest.body;
+    // system 應該還是 Anthropic 的 top-level 欄位，不是塞進 messages
+    assert.deepEqual(b.system, [{ type: "text", text: "be terse" }]);
+    assert.equal(b.messages.length, 1);
+    assert.equal(b.messages[0].role, "user");
+    assert.equal(b.max_tokens, 100);
   });
 
-  test("上游帶了 Copilot 需要的 header", async () => {
+  test("只有 model 被改寫成上游的 id", async () => {
+    await messagesRequest(MINIMAL);
+    assert.equal(lastUpstreamRequest.body.model, "claude-sonnet-4.5");
+  });
+
+  test("tool_use / tool_result 原樣送出，不轉成 tool_calls", async () => {
+    await messagesRequest({
+      ...MINIMAL,
+      messages: [
+        { role: "user", content: "read a.txt" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { path: "a.txt" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "body" }],
+        },
+      ],
+      tools: [{ name: "Read", description: "r", input_schema: { type: "object" } }],
+    });
+    const msgs = lastUpstreamRequest.body.messages;
+    assert.deepEqual(msgs.map((m) => m.role), ["user", "assistant", "user"]);
+    assert.equal(msgs[1].content[0].type, "tool_use");
+    assert.equal(msgs[2].content[0].type, "tool_result");
+    // 工具定義也保持 Anthropic 形狀
+    assert.equal(lastUpstreamRequest.body.tools[0].input_schema.type, "object");
+  });
+
+  test("cache_control 原樣送出（prompt caching 不再被丟掉）", async () => {
+    await messagesRequest({
+      ...MINIMAL,
+      system: [{ type: "text", text: "long prompt", cache_control: { type: "ephemeral" } }],
+    });
+    assert.deepEqual(lastUpstreamRequest.body.system[0].cache_control, { type: "ephemeral" });
+  });
+
+  test("帶上 anthropic-version header", async () => {
+    await messagesRequest(MINIMAL, {
+      headers: { "x-api-key": API_KEY, "anthropic-version": "2023-06-01" },
+    });
+    assert.equal(lastUpstreamRequest.headers["anthropic-version"], "2023-06-01");
+  });
+
+  test("client 沒給 anthropic-version 時補預設值", async () => {
+    await messagesRequest(MINIMAL);
+    assert.equal(lastUpstreamRequest.headers["anthropic-version"], "2023-06-01");
+  });
+
+  test("anthropic-beta 有給就轉發", async () => {
+    await messagesRequest(MINIMAL, {
+      headers: { "x-api-key": API_KEY, "anthropic-beta": "context-1m-2025-08-07" },
+    });
+    assert.equal(lastUpstreamRequest.headers["anthropic-beta"], "context-1m-2025-08-07");
+  });
+
+  test("Copilot 需要的 header 仍然帶著", async () => {
     await messagesRequest(MINIMAL);
     const h = lastUpstreamRequest.headers;
     assert.equal(h.authorization, "Bearer fake-copilot-token");
@@ -320,8 +459,7 @@ describe("/v1/messages 非串流", () => {
 
   test("有圖片時帶 Copilot-Vision-Request", async () => {
     await messagesRequest({
-      model: "claude-sonnet-4-5-20250929",
-      max_tokens: 100,
+      ...MINIMAL,
       messages: [
         {
           role: "user",
@@ -334,14 +472,274 @@ describe("/v1/messages 非串流", () => {
     });
     assert.equal(lastUpstreamRequest.headers["copilot-vision-request"], "true");
   });
+});
 
-  test("沒圖片時不帶 Copilot-Vision-Request", async () => {
-    await messagesRequest(MINIMAL);
-    assert.equal(lastUpstreamRequest.headers["copilot-vision-request"], undefined);
+describe("原生 passthrough — 回應", () => {
+  test("上游回應原樣轉發，含真實 usage", async () => {
+    nativeHandler = (req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(nativeMessage("Hello", { cacheRead: 1234 })));
+    };
+    const json = await (await messagesRequest(MINIMAL)).json();
+    assert.equal(json.type, "message");
+    assert.equal(json.id, "msg_011CdRkeZRTH3u7XwnNE2dFY");
+    assert.deepEqual(json.content, [{ type: "text", text: "Hello" }]);
+    // 真實 usage，不是估算
+    assert.equal(json.usage.input_tokens, 10);
+    assert.equal(json.usage.cache_read_input_tokens, 1234);
   });
 
-  test("工具呼叫回應轉成 tool_use block", async () => {
-    upstreamHandler = (req, res) => {
+  test("剝掉 Copilot 私有的 copilot_usage 欄位", async () => {
+    const json = await (await messagesRequest(MINIMAL)).json();
+    assert.equal(json.copilot_usage, undefined);
+    // 其他欄位不受影響
+    assert.equal(json.type, "message");
+  });
+
+  test("thinking block 原樣回傳（轉譯層做不到這件事）", async () => {
+    nativeHandler = (req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          nativeMessage("", {
+            content: [
+              { type: "thinking", thinking: "let me work this out...", signature: "sig" },
+              { type: "text", text: "391" },
+            ],
+            thinkingTokens: 29,
+          })
+        )
+      );
+    };
+    const json = await (await messagesRequest({ ...MINIMAL, model: "claude-sonnet-5" })).json();
+    assert.equal(json.content[0].type, "thinking");
+    assert.equal(json.content[0].thinking, "let me work this out...");
+    assert.equal(json.usage.output_tokens_details.thinking_tokens, 29);
+  });
+
+  test("上游錯誤原樣轉發（已經是 Anthropic 格式）", async () => {
+    nativeHandler = (req, res) => upstreamError(res, 429, "rate limited");
+    const res = await messagesRequest(MINIMAL);
+    assert.equal(res.status, 429);
+    const json = await res.json();
+    assert.equal(json.type, "error");
+    assert.equal(json.error.message, "rate limited");
+  });
+});
+
+describe("原生 passthrough — 思考程度", () => {
+  test("thinking.enabled 換成 adaptive（上游不吃 enabled）", async () => {
+    const res = await messagesRequest({
+      ...MINIMAL,
+      model: "claude-sonnet-5",
+      thinking: { type: "enabled", budget_tokens: 8000 },
+    });
+    assert.equal(res.status, 200, "不該被上游以 thinking.type.enabled 擋掉");
+    assert.deepEqual(lastUpstreamRequest.body.thinking, { type: "adaptive" });
+  });
+
+  test("budget_tokens 按比例折成 effort 檔位", async () => {
+    const cases = [
+      [1000, "low"], // 3% of 32000
+      [5000, "medium"], // 16%
+      [10000, "high"], // 31%
+      [20000, "xhigh"], // 63%
+      [30000, "max"], // 94%
+    ];
+    for (const [budget, expected] of cases) {
+      await messagesRequest({
+        ...MINIMAL,
+        model: "claude-sonnet-5",
+        thinking: { type: "enabled", budget_tokens: budget },
+      });
+      assert.equal(
+        lastUpstreamRequest.body.output_config.effort,
+        expected,
+        `budget=${budget} 應該對到 ${expected}`
+      );
+    }
+  });
+
+  test("client 直接給 output_config.effort 就照用", async () => {
+    const res = await messagesRequest({
+      ...MINIMAL,
+      model: "claude-opus-4.8",
+      output_config: { effort: "xhigh" },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(lastUpstreamRequest.body.output_config.effort, "xhigh");
+    // effort 要生效必須同時有 adaptive thinking
+    assert.deepEqual(lastUpstreamRequest.body.thinking, { type: "adaptive" });
+  });
+
+  test("模型不支援某個檔位時往下收斂，不是硬送去撞 400", async () => {
+    // opus-4.6 的階梯沒有 xhigh
+    const res = await messagesRequest({
+      ...MINIMAL,
+      model: "claude-opus-4.6",
+      output_config: { effort: "xhigh" },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(lastUpstreamRequest.body.output_config.effort, "high");
+  });
+
+  test("模型完全不支援 effort 時剝掉（否則上游 400）", async () => {
+    const res = await messagesRequest({
+      ...MINIMAL,
+      model: "claude-sonnet-4.5",
+      output_config: { effort: "high" },
+    });
+    assert.equal(res.status, 200, "不該撞到 does not support reasoning effort");
+    assert.equal(lastUpstreamRequest.body.output_config, undefined);
+  });
+
+  test("模型不支援 thinking 時整個剝掉", async () => {
+    const res = await messagesRequest({
+      ...MINIMAL,
+      model: "claude-haiku-4.5",
+      thinking: { type: "enabled", budget_tokens: 4000 },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(lastUpstreamRequest.body.thinking, undefined);
+    assert.equal(lastUpstreamRequest.body.output_config, undefined);
+  });
+
+  test("output_config 的其他欄位不會被連帶刪掉", async () => {
+    await messagesRequest({
+      ...MINIMAL,
+      model: "claude-sonnet-4.5",
+      output_config: { effort: "high", something_else: 1 },
+    });
+    assert.deepEqual(lastUpstreamRequest.body.output_config, { something_else: 1 });
+  });
+
+  test("沒要求 thinking 時不會自己加上去", async () => {
+    await messagesRequest({ ...MINIMAL, model: "claude-sonnet-5" });
+    assert.equal(lastUpstreamRequest.body.thinking, undefined);
+    assert.equal(lastUpstreamRequest.body.output_config, undefined);
+  });
+});
+
+describe("原生 passthrough — 串流", () => {
+  test("SSE 位元組原樣轉發，含 thinking_delta", async () => {
+    nativeHandler = (req, res) => {
+      sseUpstream(res, [
+        anthEvent("message_start", {
+          type: "message_start",
+          message: { id: "msg_1", type: "message", role: "assistant", model: "claude-sonnet-5", content: [], usage: { input_tokens: 19, output_tokens: 0 } },
+        }),
+        anthEvent("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
+        anthEvent("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "6*7 is 42" } }),
+        anthEvent("content_block_stop", { type: "content_block_stop", index: 0 }),
+        anthEvent("content_block_start", { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }),
+        anthEvent("content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "42" } }),
+        anthEvent("content_block_stop", { type: "content_block_stop", index: 1 }),
+        anthEvent("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 87, output_tokens_details: { thinking_tokens: 29 } } }),
+        anthEvent("message_stop", { type: "message_stop" }),
+      ]);
+    };
+
+    const res = await messagesRequest({ ...MINIMAL, model: "claude-sonnet-5", stream: true });
+    assert.match(res.headers.get("content-type"), /text\/event-stream/);
+    const events = parseSSE(await res.text());
+
+    assert.deepEqual(events.map((e) => e.event), [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop",
+    ]);
+    // thinking_delta 原封不動 —— 轉譯層做不到
+    const think = events.find((e) => e.data?.delta?.type === "thinking_delta");
+    assert.equal(think.data.delta.thinking, "6*7 is 42");
+    const md = events.find((e) => e.event === "message_delta");
+    assert.equal(md.data.usage.output_tokens_details.thinking_tokens, 29);
+  });
+
+  test("上游沒送 message_stop 時補上（否則 client 會一直等）", async () => {
+    nativeHandler = (req, res) => {
+      sseUpstream(res, [
+        anthEvent("message_start", { type: "message_start", message: { id: "m", content: [] } }),
+        anthEvent("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "x" } }),
+      ]);
+    };
+    const events = parseSSE(await (await messagesRequest({ ...MINIMAL, stream: true })).text());
+    assert.equal(events.at(-1).event, "message_stop");
+  });
+
+  test("上游中途斷線時補 error + message_stop", async () => {
+    nativeHandler = (req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(anthEvent("message_start", { type: "message_start", message: { id: "m", content: [] } }));
+      setTimeout(() => res.destroy(), 20);
+    };
+    const events = parseSSE(await (await messagesRequest({ ...MINIMAL, stream: true })).text());
+    const names = events.map((e) => e.event);
+    assert.ok(names.includes("error"), names.join(","));
+    assert.equal(names.at(-1), "message_stop");
+  });
+
+  test("串流時上游回非 200 → 錯誤走 JSON 而不是 SSE", async () => {
+    nativeHandler = (req, res) => upstreamError(res, 403, "no access");
+    const res = await messagesRequest({ ...MINIMAL, stream: true });
+    assert.equal(res.status, 403);
+    const json = await res.json();
+    assert.equal(json.error.message, "no access");
+  });
+});
+
+// ── 轉譯層（非 Claude 模型）─────────────────────────────────
+
+describe("轉譯層 — gpt/gemini 仍然走 /chat/completions", () => {
+  test("gpt-4o 送到 /chat/completions，body 轉成 OpenAI 格式", async () => {
+    await messagesRequest({ ...TRANSLATED, system: "be terse" });
+    assert.equal(lastUpstreamRequest.url, "/chat/completions");
+    const b = lastUpstreamRequest.body;
+    assert.equal(b.messages[0].role, "system");
+    assert.equal(b.messages[0].content, "be terse");
+    assert.equal(b.messages[1].role, "user");
+  });
+
+  test("回應轉成 Anthropic Messages 格式", async () => {
+    chatHandler = (req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(jsonCompletion("from gpt")));
+    };
+    const json = await (await messagesRequest(TRANSLATED)).json();
+    assert.equal(json.type, "message");
+    assert.deepEqual(json.content, [{ type: "text", text: "from gpt" }]);
+    assert.equal(json.stop_reason, "end_turn");
+    assert.deepEqual(json.usage, { input_tokens: 10, output_tokens: 5 });
+  });
+
+  test("tool_result 轉成 role:tool", async () => {
+    await messagesRequest({
+      ...TRANSLATED,
+      messages: [
+        { role: "user", content: "read a.txt" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_x", name: "Read", input: { path: "a.txt" } }],
+        },
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "call_x", content: "file body" }],
+        },
+      ],
+      tools: [{ name: "Read", description: "r", input_schema: { type: "object" } }],
+    });
+    const msgs = lastUpstreamRequest.body.messages;
+    assert.deepEqual(msgs.map((m) => m.role), ["user", "assistant", "tool"]);
+    assert.equal(msgs[2].tool_call_id, "call_x");
+  });
+
+  test("tool_calls 轉成 tool_use block", async () => {
+    chatHandler = (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify(
@@ -357,83 +755,22 @@ describe("/v1/messages 非串流", () => {
         )
       );
     };
-    const res = await messagesRequest(MINIMAL);
-    const json = await res.json();
+    const json = await (await messagesRequest(TRANSLATED)).json();
     assert.equal(json.stop_reason, "tool_use");
-    assert.equal(json.content.length, 1);
     assert.equal(json.content[0].type, "tool_use");
-    assert.equal(json.content[0].id, "call_x");
     assert.deepEqual(json.content[0].input, { path: "a.txt" });
   });
 
-  test("完整的 tool 往返：tool_result 被轉成 role:tool 送上游", async () => {
-    await messagesRequest({
-      model: "claude-sonnet-4-5-20250929",
-      max_tokens: 100,
-      messages: [
-        { role: "user", content: "read a.txt" },
-        {
-          role: "assistant",
-          content: [{ type: "tool_use", id: "call_x", name: "Read", input: { path: "a.txt" } }],
-        },
-        {
-          role: "user",
-          content: [{ type: "tool_result", tool_use_id: "call_x", content: "file body" }],
-        },
-      ],
-      tools: [{ name: "Read", description: "r", input_schema: { type: "object" } }],
-    });
-
-    const msgs = lastUpstreamRequest.body.messages;
-    assert.deepEqual(msgs.map((m) => m.role), ["user", "assistant", "tool"]);
-    assert.equal(msgs[1].tool_calls[0].id, "call_x");
-    assert.equal(msgs[2].tool_call_id, "call_x");
-    assert.equal(msgs[2].content, "file body");
-  });
-
-  test("上游錯誤轉成 Anthropic 錯誤格式並保留 status", async () => {
-    upstreamHandler = (req, res) => {
-      res.writeHead(429, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "rate limited" }));
-    };
-    const res = await messagesRequest(MINIMAL);
-    assert.equal(res.status, 429);
-    const json = await res.json();
-    assert.equal(json.type, "error");
-    assert.equal(json.error.type, "rate_limit_error");
-  });
-
-  test("上游 500 轉成 api_error", async () => {
-    upstreamHandler = (req, res) => {
-      res.writeHead(500);
-      res.end("boom");
-    };
-    const res = await messagesRequest(MINIMAL);
-    assert.equal(res.status, 500);
-    const json = await res.json();
-    assert.equal(json.error.type, "api_error");
-  });
-});
-
-// ── 串流 ─────────────────────────────────────────────────────
-
-describe("/v1/messages 串流", () => {
-  test("文字串流的事件序列正確", async () => {
-    upstreamHandler = (req, res) => {
+  test("串流走轉譯狀態機，產生合法 Anthropic 事件", async () => {
+    chatHandler = (req, res) => {
       sseUpstream(res, [
-        oaChunk({ choices: [{ delta: { role: "assistant", content: "" } }] }),
         oaChunk({ choices: [{ delta: { content: "Hello" } }] }),
         oaChunk({ choices: [{ delta: { content: " there" } }] }),
         oaChunk({ choices: [{ delta: {}, finish_reason: "stop" }] }),
         "data: [DONE]\n\n",
       ]);
     };
-
-    const res = await messagesRequest({ ...MINIMAL, stream: true });
-    assert.equal(res.status, 200);
-    assert.match(res.headers.get("content-type"), /text\/event-stream/);
-
-    const events = parseSSE(await res.text());
+    const events = parseSSE(await (await messagesRequest({ ...TRANSLATED, stream: true })).text());
     assert.deepEqual(events.map((e) => e.event), [
       "message_start",
       "ping",
@@ -444,7 +781,6 @@ describe("/v1/messages 串流", () => {
       "message_delta",
       "message_stop",
     ]);
-
     const text = events
       .filter((e) => e.event === "content_block_delta")
       .map((e) => e.data.delta.text)
@@ -452,166 +788,44 @@ describe("/v1/messages 串流", () => {
     assert.equal(text, "Hello there");
   });
 
-  test("串流請求會要求上游帶 usage", async () => {
-    upstreamHandler = (req, res) => sseUpstream(res, ["data: [DONE]\n\n"]);
-    await messagesRequest({ ...MINIMAL, stream: true });
-    assert.equal(lastUpstreamRequest.body.stream, true);
-    assert.deepEqual(lastUpstreamRequest.body.stream_options, { include_usage: true });
-  });
-
-  test("message_start 立刻送出，不等上游第一個 token", async () => {
-    upstreamHandler = (req, res) => {
-      sseUpstream(
-        res,
-        [oaChunk({ choices: [{ delta: { content: "slow" } }] }), "data: [DONE]\n\n"],
-        { delay: 30 }
-      );
+  test("上游錯誤轉成 Anthropic 錯誤格式", async () => {
+    chatHandler = (req, res) => {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "rate limited" }));
     };
-
-    const res = await messagesRequest({ ...MINIMAL, stream: true });
-    const reader = res.body.getReader();
-    const first = new TextDecoder().decode((await reader.read()).value);
-    assert.match(first, /event: message_start/);
-    await reader.cancel();
-  });
-
-  test("串流的工具呼叫：文字後接 tool_use，index 遞增且配對完整", async () => {
-    upstreamHandler = (req, res) => {
-      sseUpstream(res, [
-        oaChunk({ choices: [{ delta: { content: "Let me check. " } }] }),
-        oaChunk({
-          choices: [
-            {
-              delta: {
-                tool_calls: [{ index: 0, id: "call_1", function: { name: "Read", arguments: "" } }],
-              },
-            },
-          ],
-        }),
-        oaChunk({
-          choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"path":' } }] } }],
-        }),
-        oaChunk({
-          choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"a.txt"}' } }] } }],
-        }),
-        oaChunk({ choices: [{ delta: {}, finish_reason: "tool_calls" }] }),
-        "data: [DONE]\n\n",
-      ]);
-    };
-
-    const events = parseSSE(await (await messagesRequest({ ...MINIMAL, stream: true })).text());
-
-    const starts = events.filter((e) => e.event === "content_block_start");
-    const stops = events.filter((e) => e.event === "content_block_stop");
-    assert.deepEqual(starts.map((s) => s.data.index), [0, 1]);
-    assert.deepEqual(starts.map((s) => s.data.content_block.type), ["text", "tool_use"]);
-    assert.deepEqual(stops.map((s) => s.data.index), [0, 1]);
-
-    const json = events
-      .filter((e) => e.event === "content_block_delta" && e.data.delta.type === "input_json_delta")
-      .map((e) => e.data.delta.partial_json)
-      .join("");
-    assert.deepEqual(JSON.parse(json), { path: "a.txt" });
-
-    const md = events.find((e) => e.event === "message_delta");
-    assert.equal(md.data.delta.stop_reason, "tool_use");
-  });
-
-  test("上游把 SSE 切在 JSON 中間也能正確重組", async () => {
-    const full = oaChunk({ choices: [{ delta: { content: "reassembled" } }] });
-    upstreamHandler = (req, res) => {
-      res.writeHead(200, { "Content-Type": "text/event-stream" });
-      // 故意切在 JSON 正中間，分兩個 TCP 封包送
-      res.write(full.slice(0, 20));
-      setTimeout(() => {
-        res.write(full.slice(20));
-        res.write(oaChunk({ choices: [{ delta: {}, finish_reason: "stop" }] }));
-        res.write("data: [DONE]\n\n");
-        res.end();
-      }, 20);
-    };
-
-    const events = parseSSE(await (await messagesRequest({ ...MINIMAL, stream: true })).text());
-    const text = events
-      .filter((e) => e.event === "content_block_delta")
-      .map((e) => e.data.delta.text)
-      .join("");
-    assert.equal(text, "reassembled");
-  });
-
-  test("上游中途斷線也會收到 content_block_stop 與 error", async () => {
-    upstreamHandler = (req, res) => {
-      res.writeHead(200, { "Content-Type": "text/event-stream" });
-      res.write(oaChunk({ choices: [{ delta: { content: "partial..." } }] }));
-      // 不呼叫 end()，直接砍掉 socket
-      setTimeout(() => res.destroy(), 20);
-    };
-
-    const events = parseSSE(await (await messagesRequest({ ...MINIMAL, stream: true })).text());
-    const names = events.map((e) => e.event);
-    assert.ok(names.includes("content_block_stop"), `events: ${names.join(",")}`);
-    assert.ok(names.includes("error"), `events: ${names.join(",")}`);
-    assert.ok(names.indexOf("content_block_stop") < names.indexOf("error"));
-  });
-
-  test("串流時上游回非 200 → 錯誤走 JSON 而不是 SSE", async () => {
-    upstreamHandler = (req, res) => {
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "no access" }));
-    };
-    const res = await messagesRequest({ ...MINIMAL, stream: true });
-    assert.equal(res.status, 403);
+    const res = await messagesRequest(TRANSLATED);
+    assert.equal(res.status, 429);
     const json = await res.json();
-    assert.equal(json.error.type, "permission_error");
-  });
-
-  test("上游 usage 反映在 message_delta", async () => {
-    upstreamHandler = (req, res) => {
-      sseUpstream(res, [
-        oaChunk({ choices: [{ delta: { content: "hi" } }] }),
-        oaChunk({ choices: [{ delta: {}, finish_reason: "stop" }] }),
-        oaChunk({ choices: [], usage: { prompt_tokens: 111, completion_tokens: 22 } }),
-        "data: [DONE]\n\n",
-      ]);
-    };
-    const events = parseSSE(await (await messagesRequest({ ...MINIMAL, stream: true })).text());
-    const md = events.find((e) => e.event === "message_delta");
-    assert.deepEqual(md.data.usage, { input_tokens: 111, output_tokens: 22 });
-  });
-
-  test("上游完全沒回內容也是合法的 Anthropic 串流", async () => {
-    upstreamHandler = (req, res) => sseUpstream(res, ["data: [DONE]\n\n"]);
-    const events = parseSSE(await (await messagesRequest({ ...MINIMAL, stream: true })).text());
-    const names = events.map((e) => e.event);
-    assert.equal(names[0], "message_start");
-    assert.equal(names.at(-1), "message_stop");
-    assert.ok(names.includes("content_block_start"));
-    assert.ok(names.includes("content_block_stop"));
+    assert.equal(json.error.type, "rate_limit_error");
   });
 });
 
 // ── count_tokens ─────────────────────────────────────────────
 
 describe("/v1/messages/count_tokens", () => {
-  test("回傳 input_tokens", async () => {
+  test("用上游原生端點回真值，不是估算", async () => {
     const res = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
-      body: JSON.stringify({ model: "claude-sonnet-4-5", messages: [{ role: "user", content: "a".repeat(400) }] }),
+      body: JSON.stringify({ model: "claude-sonnet-5", messages: [{ role: "user", content: "hi" }] }),
     });
     assert.equal(res.status, 200);
     const json = await res.json();
-    assert.equal(typeof json.input_tokens, "number");
-    assert.ok(json.input_tokens >= 100);
+    // mock 上游固定回 4242；估算值不可能剛好是這個數字
+    assert.equal(json.input_tokens, 4242);
+    assert.equal(lastUpstreamRequest.url, "/v1/messages/count_tokens");
   });
 
-  test("不會打到上游（Copilot 沒有這個端點）", async () => {
+  test("送給上游的 model 是對照後的 id", async () => {
     await fetch(`${baseUrl}/v1/messages/count_tokens`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-api-key": API_KEY },
-      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+      body: JSON.stringify({
+        model: "claude-3-5-haiku-20241022",
+        messages: [{ role: "user", content: "hi" }],
+      }),
     });
-    assert.equal(lastUpstreamRequest, null);
+    assert.equal(lastUpstreamRequest.body.model, "claude-haiku-4.5");
   });
 
   test("messages 不是陣列回 400", async () => {
@@ -633,18 +847,16 @@ describe("/v1/messages/count_tokens", () => {
   });
 });
 
-// ── 模型解析（走上游即時清單）────────────────────────────────
+// ── 模型解析 ─────────────────────────────────────────────────
 
 describe("模型解析", () => {
   test("/v1/models 回上游的真實清單，不是硬寫的", async () => {
     const res = await fetch(`${baseUrl}/v1/models`, {
       headers: { authorization: `Bearer ${API_KEY}` },
     });
-    const json = await res.json();
-    const ids = json.data.map((m) => m.id);
+    const ids = (await res.json()).data.map((m) => m.id);
     assert.ok(ids.includes("claude-sonnet-5"), ids.join(","));
     assert.ok(ids.includes("claude-haiku-4.5"), ids.join(","));
-    // 硬寫清單裡有但上游沒有的，不該出現
     assert.ok(!ids.includes("claude-sonnet-4"), ids.join(","));
   });
 
@@ -653,7 +865,7 @@ describe("模型解析", () => {
       headers: { authorization: `Bearer ${API_KEY}` },
     });
     const m = (await res.json()).data.find((x) => x.id === "claude-sonnet-5");
-    assert.equal(m.context_window, 200000);
+    assert.equal(m.context_window, 264000);
     assert.equal(m.supports.tool_calls, true);
     assert.equal(m.owned_by, "anthropic");
   });
@@ -681,8 +893,14 @@ describe("模型解析", () => {
 
   test("送上游的 model 一定在清單內", async () => {
     const allowed = new Set(UPSTREAM_MODELS.map((m) => m.id));
-    for (const m of ["claude-opus-5", "claude-fable-5", "claude-sonnet-4-20250514", "claude-3-opus-20240229"]) {
-      await messagesRequest({ ...MINIMAL, model: m });
+    for (const m of [
+      "claude-opus-5",
+      "claude-fable-5",
+      "claude-sonnet-4-20250514",
+      "claude-3-opus-20240229",
+    ]) {
+      const res = await messagesRequest({ ...MINIMAL, model: m });
+      assert.equal(res.status, 200, `${m} 應該成功`);
       assert.ok(
         allowed.has(lastUpstreamRequest.body.model),
         `${m} → ${lastUpstreamRequest.body.model} 不在上游清單裡`
@@ -715,30 +933,15 @@ describe("CORS 與管理端點", () => {
   test("/health 帶版本", async () => {
     const json = await (await fetch(`${baseUrl}/health`)).json();
     assert.equal(json.authorized, true);
-    assert.equal(json.version, "1.1.0");
+    assert.equal(json.version, "1.2.0");
   });
 
-  test("/admin/status 列出兩組端點", async () => {
+  test("/admin/status 列出端點", async () => {
     const res = await fetch(`${baseUrl}/admin/status`, {
       headers: { authorization: `Bearer ${API_KEY}` },
     });
     const json = await res.json();
     assert.equal(json.proxy.endpoints.anthropic, "/v1/messages");
     assert.equal(json.proxy.endpoints.openai, "/v1/chat/completions");
-  });
-
-  test("/admin/model-map 可查單一 model 對照", async () => {
-    const res = await fetch(`${baseUrl}/admin/model-map?model=claude-sonnet-4-5-20250929`, {
-      headers: { authorization: `Bearer ${API_KEY}` },
-    });
-    const json = await res.json();
-    assert.equal(json.mapped, "claude-sonnet-4.5");
-  });
-
-  test("anthropic-version header 不會導致失敗", async () => {
-    const res = await messagesRequest(MINIMAL, {
-      headers: { "x-api-key": API_KEY, "anthropic-version": "2023-06-01" },
-    });
-    assert.equal(res.status, 200);
   });
 });

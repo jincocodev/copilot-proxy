@@ -1,6 +1,6 @@
 {
   "name": "copilot-proxy",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Lightweight proxy exposing GitHub Copilot through both OpenAI-compatible and Anthropic Messages APIs, with automatic token management",
   "main": "index.js",
   "scripts": {

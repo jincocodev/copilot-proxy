@@ -5,6 +5,10 @@
 - `/v1/chat/completions` — OpenAI 相容（Dify、Xcode Intelligence、OpenAI SDK…）
 - `/v1/messages` — Anthropic Messages（**Claude Code**、Anthropic SDK）
 
+Claude 模型走 **passthrough**：Copilot 對它們開了原生 `/v1/messages`，所以直接轉發，
+extended thinking、prompt caching、精確 token 計數都拿得到。gpt / gemini 只有
+`/chat/completions`，那條路才需要協議轉譯。
+
 ## 快速開始（Docker，推薦）
 
 ```bash
@@ -104,8 +108,10 @@ Copilot 的模型清單會變（實測就遇到 `claude-sonnet-4` 被下架、�
 
 ```
 ⚠️  Copilot 沒有 claude-opus-5，改用 claude-opus-4.8。可用清單見 GET /v1/models
-✅ [anthropic] claude-opus-5→claude-opus-4.8 200 (6376ms)
+✅ [native] claude-opus-5→claude-opus-4.8 200 (6376ms) in=18 out=410 think=212 cost=413600000nAIU
 ```
+
+`[native]` = 走 passthrough，`[anthropic]` = 走轉譯層。
 
 查目前上游有什麼、以及某個名稱會被對到哪：
 
@@ -119,20 +125,74 @@ curl "http://localhost:3456/admin/model-map?model=claude-opus-5" -H "Authorizati
 > `ANTHROPIC_MODEL` 環境變數（見 `claude-code.sh`），但 Claude Code 裡用 `/model`
 > 存過的預設會蓋掉環境變數。
 
+### 思考程度（extended thinking）
+
+可以調。上游的形狀跟官方 Anthropic API 不同，proxy 會自動敉平，所以兩種寫法都收：
+
+```bash
+# 官方形狀 —— proxy 自動換成上游的 adaptive + effort
+-d '{"model":"claude-sonnet-5","max_tokens":3000,
+     "thinking":{"type":"enabled","budget_tokens":20000},
+     "messages":[...]}'
+
+# 上游原生形狀 —— 直接指定檔位
+-d '{"model":"claude-sonnet-5","max_tokens":3000,
+     "thinking":{"type":"adaptive"},"output_config":{"effort":"high"},
+     "messages":[...]}'
+```
+
+`budget_tokens` 按佔上限（32000）的比例折成檔位：<10% → low、<25% → medium、
+<50% → high、<75% → xhigh、其餘 max。
+
+實測 `claude-sonnet-5`（同一個問題，只改 effort）：
+
+| effort | thinking_tokens | output_tokens |
+|---|---|---|
+| low | 35 | 95 |
+| high | 186 | 363 |
+| max | 212 | 410 |
+
+**只有部分模型支援**，而且階梯不一樣：
+
+| 模型 | effort 檔位 |
+|---|---|
+| `claude-sonnet-5`、`claude-opus-4.7`、`claude-opus-4.8` | low / medium / high / xhigh / max |
+| `claude-opus-4.6`、`claude-sonnet-4.6` | low / medium / high / max（沒有 xhigh） |
+| `claude-sonnet-4.5`、`claude-opus-4.5`、`claude-haiku-4.5` | 不支援 |
+
+送了模型不支援的東西，上游會回 400。proxy 會先擋下來：不支援的檔位往下收斂
+（`xhigh` → `high`），完全不支援的整個剝除，並在 log 留一行：
+
+```
+   ↳ [native] thinking.enabled(budget=20000) → adaptive+effort=xhigh
+   ↳ [native] claude-haiku-4.5 不支援 thinking，已剝除
+```
+
+`thinking.type: "adaptive"` 的意思是模型自己決定要不要想 —— 簡單問題可能
+`thinking_tokens=0`，那不是故障。
+
 ### Copilot 上游缺的能力
 
-透過 Copilot 走的話，以下 Anthropic 功能拿不到：
+走 Claude 模型（passthrough）時，幾乎沒有損失：
 
 | 功能 | 狀況 |
 |---|---|
-| Prompt caching | **不支援**。`cache_control` 會被忽略，長 session 的成本降不下來 |
-| Extended thinking | **不支援**。`thinking` block 不會往上游送，也不會回傳 |
-| Token 計數 | **估算值**。Copilot 沒有 count_tokens 端點，Claude Code 顯示的 context 用量會有誤差（約 4 char/token，圖片固定算 1500） |
-| `top_k` | 忽略（OpenAI 格式沒有對應欄位） |
-| tool_result 內的圖片 | 會被換成文字佔位符（OpenAI 的 tool message 不支援圖片） |
-| 伺服器端工具（web_search 等） | 略過不送 |
+| Extended thinking | ✅ 支援，見上節 |
+| Prompt caching | ✅ `cache_control` 原樣轉發，usage 回報 `cache_read_input_tokens`／`cache_creation_input_tokens`（快取有 1024 token 最低門檻） |
+| Token 計數 | ✅ 用上游原生 `count_tokens`，回真值 |
+| 圖片輸入 | ✅ |
+| 工具呼叫 / 串流 | ✅ |
 
-一般的對話、檔案編輯、工具呼叫、串流、視覺輸入都可以正常用。
+走 gpt / gemini（轉譯層）時才有這些限制：
+
+| 功能 | 狀況 |
+|---|---|
+| Extended thinking | 不支援 —— `/chat/completions` 的回應格式載不了 thinking block |
+| Prompt caching | 不支援，`cache_control` 被忽略 |
+| Token 計數 | 估算（約 4 char/token，圖片固定算 1500） |
+| `top_k` | 忽略（OpenAI 格式沒有對應欄位） |
+| tool_result 內的圖片 | 換成文字佔位符（OpenAI 的 tool message 不支援圖片） |
+| 伺服器端工具（web_search 等） | 略過不送 |
 
 ## API Endpoints
 
@@ -156,7 +216,7 @@ curl http://localhost:3456/v1/messages \
   -d '{"model":"claude-sonnet-4.5","max_tokens":1024,"stream":true,
        "messages":[{"role":"user","content":"hello"}]}'
 
-# Token 估算（Copilot 沒有這個端點，回的是估算值）
+# Token 計數（Claude 模型用上游原生端點，回真值）
 curl http://localhost:3456/v1/messages/count_tokens \
   -H "Content-Type: application/json" \
   -H "x-api-key: YOUR_PROXY_API_KEY" \
@@ -279,9 +339,10 @@ npm test
 | 檔案 | 用途 |
 |------|------|
 | `index.js` | Express 路由、認證、CORS |
-| `proxy.js` | 上游呼叫、OpenAI 直通、Anthropic 端點處理 |
-| `anthropic-adapter.js` | 請求／回應轉譯、model 對照、token 估算 |
-| `anthropic-stream.js` | SSE 串流狀態機（OpenAI chunk → Anthropic 事件） |
+| `proxy.js` | 上游呼叫、模型清單快取、原生 passthrough、轉譯層路由 |
+| `anthropic-native.js` | 原生 passthrough 的能力閘門（thinking 形狀轉換、effort 收斂） |
+| `anthropic-adapter.js` | 請求／回應轉譯、model 對照、token 估算（非 Claude 模型用） |
+| `anthropic-stream.js` | SSE 串流狀態機（OpenAI chunk → Anthropic 事件，非 Claude 模型用） |
 | `token-manager.js` | GitHub device flow、Copilot token 續期 |
 | `auth.sh` | 觸發 GitHub 授權，輪詢到完成 |
 | `claude-code.sh` | 健康檢查 + 帶環境變數啟動 Claude Code |

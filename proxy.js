@@ -4,8 +4,14 @@ import {
   openAIToAnthropic,
   estimateTokens,
   anthropicError,
+  mapModel,
 } from "./anthropic-adapter.js";
 import { AnthropicStreamTranslator } from "./anthropic-stream.js";
+import {
+  supportsNativeMessages,
+  prepareNativeBody,
+  stripCopilotFields,
+} from "./anthropic-native.js";
 
 function buildHeaders(copilotToken, { vision = false, agent = false } = {}) {
   const headers = {
@@ -37,7 +43,7 @@ function hasImageContent(body) {
 // 每次都拿 400 model_not_supported）。改成問上游，快取 10 分鐘。
 
 const MODELS_CACHE_TTL_MS = 10 * 60 * 1000;
-let modelsCache = { ids: null, data: null, fetchedAt: 0, inFlight: null };
+let modelsCache = { ids: null, data: null, byId: null, fetchedAt: 0, inFlight: null };
 
 async function fetchUpstreamModels() {
   const copilotToken = await ensureCopilotToken();
@@ -50,7 +56,11 @@ async function fetchUpstreamModels() {
 
   // 只留能對話的：embedding 之類的沒有 max_context_window_tokens
   const chat = all.filter((m) => m?.id && m?.capabilities?.limits?.max_context_window_tokens);
-  return { ids: chat.map((m) => m.id), data: chat };
+  return {
+    ids: chat.map((m) => m.id),
+    data: chat,
+    byId: new Map(chat.map((m) => [m.id, m])),
+  };
 }
 
 // 拿不到就回 null，呼叫端各自退回靜態行為
@@ -61,8 +71,8 @@ async function getUpstreamModels() {
 
   modelsCache.inFlight = (async () => {
     try {
-      const { ids, data } = await fetchUpstreamModels();
-      modelsCache = { ids, data, fetchedAt: Date.now(), inFlight: null };
+      const fetched = await fetchUpstreamModels();
+      modelsCache = { ...fetched, fetchedAt: Date.now(), inFlight: null };
       return modelsCache;
     } catch (err) {
       console.error(`⚠️  取不到上游模型清單，改用靜態對照：${err.message}`);
@@ -73,6 +83,26 @@ async function getUpstreamModels() {
   })();
 
   return modelsCache.inFlight;
+}
+
+// 原生 /v1/messages 用的 header。Anthropic 協議自己的 header 要帶過去。
+function buildNativeHeaders(copilotToken, req, { vision, agent }) {
+  const headers = buildHeaders(copilotToken, { vision, agent });
+  headers["anthropic-version"] = req.headers["anthropic-version"] || "2023-06-01";
+  const beta = req.headers["anthropic-beta"];
+  if (beta) headers["anthropic-beta"] = beta;
+  return headers;
+}
+
+// Anthropic 原生 body 裡有沒有圖片（跟 OpenAI 那版的欄位不同）
+function hasNativeImage(body) {
+  for (const msg of body?.messages || []) {
+    if (!Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (block?.type === "image") return true;
+    }
+  }
+  return false;
 }
 
 // OpenAI 與 Anthropic 兩條路徑共用的上游呼叫
@@ -174,7 +204,22 @@ async function anthropicRequest(req, res) {
 
   // 依上游即時清單挑模型，取不到清單就退回靜態對照
   const upstreamModels = await getUpstreamModels().catch(() => null);
+  const resolvedId = mapModel(requestedModel, upstreamModels?.ids ?? null);
+  const modelInfo = upstreamModels?.byId?.get(resolvedId) ?? null;
 
+  // Copilot 對 Claude 模型有原生 /v1/messages —— 直接轉發，不經 OpenAI 轉譯。
+  // 這條路才拿得到 extended thinking、prompt caching 和精確 token 計數。
+  if (supportsNativeMessages(modelInfo)) {
+    return await nativeAnthropicRequest(req, res, {
+      requestedModel,
+      resolvedId,
+      modelInfo,
+      isStream,
+      start,
+    });
+  }
+
+  // 非 Claude 模型（gpt-*/gemini-*）只有 /chat/completions，走轉譯層
   let openaiBody;
   try {
     openaiBody = anthropicToOpenAI(body, upstreamModels?.ids ?? null);
@@ -221,6 +266,120 @@ async function anthropicRequest(req, res) {
   }
 }
 
+// ── 原生 passthrough ────────────────────────────────────────
+
+async function nativeAnthropicRequest(req, res, { requestedModel, resolvedId, modelInfo, isStream, start }) {
+  const label = `${requestedModel}→${resolvedId}`;
+  const { body, notes } = prepareNativeBody(req.body, resolvedId, modelInfo);
+
+  for (const note of notes) {
+    console.log(`   ↳ [native] ${note}`);
+  }
+
+  try {
+    const copilotToken = await ensureCopilotToken();
+    const upstream = await fetch(`${state.apiBaseUrl}/v1/messages`, {
+      method: "POST",
+      headers: buildNativeHeaders(copilotToken, req, {
+        vision: hasNativeImage(body),
+        agent: Array.isArray(body.tools) && body.tools.length > 0,
+      }),
+      body: JSON.stringify(body),
+    });
+
+    if (!upstream.ok) {
+      const errText = await upstream.text();
+      console.error(`❌ [native] ${label} ${upstream.status} (${Date.now() - start}ms): ${errText.slice(0, 300)}`);
+      // 上游已經是 Anthropic 錯誤格式，能原樣轉就原樣轉
+      let payload;
+      try {
+        const parsed = JSON.parse(errText);
+        payload = parsed?.type === "error" ? parsed : anthropicError(upstream.status, errText);
+      } catch {
+        payload = anthropicError(upstream.status, errText);
+      }
+      res.status(upstream.status).json(payload);
+      return { success: false };
+    }
+
+    if (isStream) {
+      return await pipeNativeStream(upstream, res, { label, start });
+    }
+
+    const raw = await upstream.json();
+    const { json, costNanoAiu } = stripCopilotFields(raw);
+    res.json(json);
+
+    const think = json.usage?.output_tokens_details?.thinking_tokens;
+    console.log(
+      `✅ [native] ${label} 200 (${Date.now() - start}ms)` +
+        ` in=${json.usage?.input_tokens ?? "?"} out=${json.usage?.output_tokens ?? "?"}` +
+        (think ? ` think=${think}` : "") +
+        (json.usage?.cache_read_input_tokens ? ` cache_read=${json.usage.cache_read_input_tokens}` : "") +
+        (costNanoAiu ? ` cost=${costNanoAiu}nAIU` : "")
+    );
+    return { success: true };
+  } catch (err) {
+    console.error(`❌ [native] ${label} 502 (${Date.now() - start}ms): ${err.message}`);
+    if (!res.headersSent) {
+      res.status(502).json(anthropicError(502, err.message || "Proxy error"));
+    } else {
+      res.end();
+    }
+    return { success: false };
+  }
+}
+
+// 原生串流直接轉發位元組，不解析、不重組 —— 這是 passthrough 的重點。
+// 只在上游中途爆掉時補一個 error 事件，讓 client 不會無限等待。
+async function pipeNativeStream(upstream, res, { label, start }) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let sawMessageStop = false;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      bytes += chunk.length;
+      if (chunk.includes("message_stop")) sawMessageStop = true;
+      res.write(chunk);
+    }
+
+    // 上游正常結束但沒送 message_stop，client 會一直等
+    if (!sawMessageStop) {
+      res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+      console.warn(`⚠️  [native] ${label} 串流結束但沒有 message_stop，已補上`);
+    }
+    res.end();
+    console.log(`✅ [native] ${label} 200 (${Date.now() - start}ms) [stream] ${bytes}B`);
+    return { success: true };
+  } catch (err) {
+    console.error(`❌ [native] ${label} stream aborted (${Date.now() - start}ms): ${err.message}`);
+    try {
+      res.write(
+        `event: error\ndata: ${JSON.stringify({
+          type: "error",
+          error: { type: "api_error", message: err.message || "Upstream stream failed" },
+        })}\n\n`
+      );
+      res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+      res.end();
+    } catch {
+      // client 已經斷線
+    }
+    return { success: false };
+  }
+}
+
 async function streamAnthropic(upstream, res, { model, inputTokens, label, start }) {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -258,6 +417,18 @@ async function streamAnthropic(upstream, res, { model, inputTokens, label, start
   }
 }
 
+// 上游有原生 count_tokens，回的是真值而不是估算
+async function nativeCountTokens(req, resolvedId) {
+  const copilotToken = await ensureCopilotToken();
+  const res = await fetch(`${state.apiBaseUrl}/v1/messages/count_tokens`, {
+    method: "POST",
+    headers: buildNativeHeaders(copilotToken, req, { vision: false, agent: false }),
+    body: JSON.stringify({ ...req.body, model: resolvedId }),
+  });
+  if (!res.ok) throw new Error(`Upstream count_tokens failed: HTTP ${res.status}`);
+  return res.json();
+}
+
 export {
   proxyRequest,
   anthropicRequest,
@@ -265,4 +436,5 @@ export {
   buildHeaders,
   hasImageContent,
   getUpstreamModels,
+  nativeCountTokens,
 };

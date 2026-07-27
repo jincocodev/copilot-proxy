@@ -10,13 +10,18 @@ import {
   startDeviceFlow,
   getStatus,
 } from "./token-manager.js";
-import { proxyRequest, anthropicRequest, getUpstreamModels } from "./proxy.js";
+import {
+  proxyRequest,
+  anthropicRequest,
+  getUpstreamModels,
+  nativeCountTokens,
+} from "./proxy.js";
 import { estimateTokens, mapModel } from "./anthropic-adapter.js";
 
 const app = express();
 const PORT = process.env.PORT || 3456;
 const PROXY_API_KEY = process.env.PROXY_API_KEY || "";
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 
 // ── CORS ──
 app.use((req, res, next) => {
@@ -162,9 +167,9 @@ app.post("/v1/chat/completions", apiKeyAuth, requireAuth, async (req, res) => {
 
 // --- Anthropic Messages endpoints (Claude Code) ---
 
-// Copilot 沒有 count_tokens 端點，這裡是估算值。
+// 上游有原生 count_tokens，回真值；打不到才退回估算。
 // 要放在 /v1/messages 前面註冊，否則會被吃掉。
-app.post("/v1/messages/count_tokens", anthropicApiKeyAuth, (req, res) => {
+app.post("/v1/messages/count_tokens", anthropicApiKeyAuth, async (req, res) => {
   const body = req.body || {};
   if (!Array.isArray(body.messages)) {
     return res.status(400).json({
@@ -172,6 +177,18 @@ app.post("/v1/messages/count_tokens", anthropicApiKeyAuth, (req, res) => {
       error: { type: "invalid_request_error", message: "messages must be an array" },
     });
   }
+
+  if (isAuthorized()) {
+    try {
+      const upstream = await getUpstreamModels().catch(() => null);
+      const resolvedId = mapModel(body.model, upstream?.ids ?? null);
+      const json = await nativeCountTokens(req, resolvedId);
+      if (typeof json?.input_tokens === "number") return res.json(json);
+    } catch (err) {
+      console.warn(`⚠️  原生 count_tokens 失敗，改用估算：${err.message}`);
+    }
+  }
+
   res.json({ input_tokens: estimateTokens(body) });
 });
 
