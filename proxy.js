@@ -42,6 +42,10 @@ function hasImageContent(body) {
 // 硬寫清單會過期（實際踩過：Copilot 下架了 claude-sonnet-4，但我們還在送，
 // 每次都拿 400 model_not_supported）。改成問上游，快取 10 分鐘。
 
+// 伺服器端預設思考檔位。Claude Code 不一定會把它自己的 effort 設定透過
+// Anthropic 協議送出來，所以留一個不依賴 client 的開關。
+const DEFAULT_THINKING_EFFORT = (process.env.COPILOT_THINKING_EFFORT || "").trim() || null;
+
 const MODELS_CACHE_TTL_MS = 10 * 60 * 1000;
 let modelsCache = { ids: null, data: null, byId: null, fetchedAt: 0, inFlight: null };
 
@@ -270,8 +274,18 @@ async function anthropicRequest(req, res) {
 
 async function nativeAnthropicRequest(req, res, { requestedModel, resolvedId, modelInfo, isStream, start }) {
   const label = `${requestedModel}→${resolvedId}`;
-  const { body, notes } = prepareNativeBody(req.body, resolvedId, modelInfo);
+  const { body, notes } = prepareNativeBody(req.body, resolvedId, modelInfo, {
+    defaultEffort: DEFAULT_THINKING_EFFORT,
+  });
 
+  // 記錄 client 到底送了什麼思考參數 —— 用來判斷 Claude Code 有沒有送
+  const asked = req.body?.thinking || req.body?.output_config?.effort;
+  if (asked) {
+    console.log(
+      `   ↳ [native] client 要求 thinking=${JSON.stringify(req.body.thinking)}` +
+        ` output_config=${JSON.stringify(req.body.output_config)}`
+    );
+  }
   for (const note of notes) {
     console.log(`   ↳ [native] ${note}`);
   }
@@ -430,6 +444,7 @@ async function nativeCountTokens(req, resolvedId) {
 }
 
 export {
+  DEFAULT_THINKING_EFFORT,
   proxyRequest,
   anthropicRequest,
   callCopilot,

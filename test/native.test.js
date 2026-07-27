@@ -285,3 +285,69 @@ describe("stripCopilotFields", () => {
     assert.equal(stripCopilotFields(null).json, null);
   });
 });
+
+describe("prepareNativeBody — 伺服器端預設 effort", () => {
+  test("client 沒表態時套用預設", () => {
+    const { body, notes } = prepareNativeBody({ ...BASE }, "claude-sonnet-5", FULL, {
+      defaultEffort: "high",
+    });
+    assert.equal(body.output_config.effort, "high");
+    assert.deepEqual(body.thinking, { type: "adaptive" });
+    assert.ok(notes.some((n) => n.includes("COPILOT_THINKING_EFFORT")));
+  });
+
+  test("client 明確給 effort 時以 client 為準", () => {
+    const { body } = prepareNativeBody(
+      { ...BASE, output_config: { effort: "low" } },
+      "claude-sonnet-5",
+      FULL,
+      { defaultEffort: "max" }
+    );
+    assert.equal(body.output_config.effort, "low");
+  });
+
+  test("client 給了 thinking 也算表態，不套預設", () => {
+    const { body } = prepareNativeBody(
+      { ...BASE, thinking: { type: "enabled", budget_tokens: 2000 } },
+      "claude-sonnet-5",
+      FULL,
+      { defaultEffort: "max" }
+    );
+    // budget 2000/32000 = 6% → low，不是預設的 max
+    assert.equal(body.output_config.effort, "low");
+  });
+
+  test("client 明確關閉思考時不被預設覆蓋", () => {
+    const { body } = prepareNativeBody(
+      { ...BASE, thinking: { type: "disabled" } },
+      "claude-sonnet-5",
+      FULL,
+      { defaultEffort: "high" }
+    );
+    assert.equal(body.thinking, undefined);
+    assert.equal(body.output_config, undefined);
+  });
+
+  test("模型不支援 effort 時預設不生效，也不會製造 400", () => {
+    const { body } = prepareNativeBody({ ...BASE }, "claude-sonnet-4.5", PLAIN, {
+      defaultEffort: "high",
+    });
+    assert.equal(body.output_config, undefined);
+    assert.equal(body.thinking, undefined);
+  });
+
+  test("預設檔位超出模型階梯時往下收斂", () => {
+    const { body } = prepareNativeBody({ ...BASE }, "claude-opus-4.6", NO_XHIGH, {
+      defaultEffort: "xhigh",
+    });
+    assert.equal(body.output_config.effort, "high");
+  });
+
+  test("沒設預設時行為不變", () => {
+    const { body, notes } = prepareNativeBody({ ...BASE }, "claude-sonnet-5", FULL, {
+      defaultEffort: null,
+    });
+    assert.equal(body.thinking, undefined);
+    assert.deepEqual(notes, []);
+  });
+});

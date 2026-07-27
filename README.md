@@ -171,6 +171,28 @@ curl "http://localhost:3456/admin/model-map?model=claude-opus-5" -H "Authorizati
 `thinking.type: "adaptive"` 的意思是模型自己決定要不要想 —— 簡單問題可能
 `thinking_tokens=0`，那不是故障。
 
+#### 從 Claude Code 開啟
+
+Claude Code 不一定會把它自己的 effort 設定透過 Anthropic 協議送出來，所以有一個
+不依賴 client 的伺服器端開關：
+
+```bash
+echo 'COPILOT_THINKING_EFFORT=high' >> .env
+docker compose up -d
+```
+
+client 完全沒表態時才套用；client 明確指定 `thinking` 或 `output_config.effort`
+就以 client 為準。不支援的模型自動略過，不會製造 400。
+
+確認目前設定與 client 到底送了什麼：
+
+```bash
+curl -s http://localhost:3456/admin/status -H "Authorization: Bearer YOUR_PROXY_API_KEY" \
+  | grep thinking_effort_default
+
+docker compose logs -f --tail 0     # 有 client 要求 thinking=... 就是 client 送的
+```
+
 ### Copilot 上游缺的能力
 
 走 Claude 模型（passthrough）時，幾乎沒有損失：
@@ -325,6 +347,7 @@ Anthropic 的 opus 4.5/4.6/4.7/4.8、sonnet 4.5/4.6/5、haiku 4.5，
 | `PORT` | `3456` | 監聽 port |
 | `PROXY_API_KEY` | (空) | API key，空 = 不驗證 |
 | `CREDENTIALS_PATH` | `.credentials.json` | GitHub token 儲存路徑 |
+| `COPILOT_THINKING_EFFORT` | (空) | 伺服器端預設思考檔位（`low`…`max`），空 = 由 client 決定 |
 
 ## 測試
 

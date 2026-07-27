@@ -61,7 +61,11 @@ function budgetToEffort(budgetTokens, modelInfo) {
 }
 
 // 回 { body, notes }。notes 是被改動或剝掉的東西，給 log 用。
-function prepareNativeBody(original, resolvedModelId, modelInfo) {
+//
+// defaultEffort：伺服器端預設檔位（COPILOT_THINKING_EFFORT）。Claude Code 不一定
+// 會把它自己的 effort 設定透過 Anthropic 協議送出來，所以留一個不依賴 client 的開關。
+// client 明確指定時一律以 client 為準。
+function prepareNativeBody(original, resolvedModelId, modelInfo, { defaultEffort = null } = {}) {
   const body = { ...original, model: resolvedModelId };
   const notes = [];
 
@@ -70,6 +74,13 @@ function prepareNativeBody(original, resolvedModelId, modelInfo) {
 
   // client 直接給 output_config.effort（上游原生形狀）
   let wantedEffort = body.output_config?.effort ?? null;
+  const clientAskedThinking = !!(wantedEffort || body.thinking);
+
+  // client 完全沒表態才套用伺服器預設
+  if (!clientAskedThinking && defaultEffort && efforts && adaptive) {
+    wantedEffort = defaultEffort;
+    notes.push(`套用預設 effort=${defaultEffort}（COPILOT_THINKING_EFFORT）`);
+  }
 
   // client 給官方形狀的 thinking
   const thinking = body.thinking;

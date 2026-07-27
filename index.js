@@ -15,6 +15,7 @@ import {
   anthropicRequest,
   getUpstreamModels,
   nativeCountTokens,
+  DEFAULT_THINKING_EFFORT,
 } from "./proxy.js";
 import { estimateTokens, mapModel } from "./anthropic-adapter.js";
 
@@ -213,6 +214,7 @@ app.get("/admin/status", apiKeyAuth, (req, res) => {
       started_at: stats.startedAt,
       port: PORT,
       api_key_set: !!PROXY_API_KEY,
+      thinking_effort_default: DEFAULT_THINKING_EFFORT,
       endpoints: {
         openai: "/v1/chat/completions",
         anthropic: "/v1/messages",
