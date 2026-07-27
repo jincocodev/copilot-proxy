@@ -15,6 +15,7 @@ import {
   anthropicRequest,
   getUpstreamModels,
   nativeCountTokens,
+  applyModelOverride,
   DEFAULT_THINKING_EFFORT,
   DEFAULT_MODEL_OVERRIDE,
 } from "./proxy.js";
@@ -183,7 +184,8 @@ app.post("/v1/messages/count_tokens", anthropicApiKeyAuth, async (req, res) => {
   if (isAuthorized()) {
     try {
       const upstream = await getUpstreamModels().catch(() => null);
-      const resolvedId = mapModel(body.model, upstream?.ids ?? null);
+      // 要跟實際請求用同一個模型，否則計數對到的是別的模型
+      const resolvedId = mapModel(applyModelOverride(body.model), upstream?.ids ?? null);
       const json = await nativeCountTokens(req, resolvedId);
       if (typeof json?.input_tokens === "number") return res.json(json);
     } catch (err) {

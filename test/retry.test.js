@@ -6,7 +6,8 @@ process.env.PROXY_API_KEY = "test-key-123";
 process.env.COPILOT_THINKING_EFFORT = "";
 process.env.COPILOT_DEFAULT_MODEL = "";
 
-const { describeError, isTransientNetworkError, fetchWithRetry } = await import("../proxy.js");
+const { describeError, isTransientNetworkError, isRetryableForIdempotent, fetchWithRetry } =
+  await import("../proxy.js");
 
 // undici 連線失敗的形狀：TypeError: fetch failed，真正原因在 cause
 function undiciError(code) {
@@ -33,15 +34,23 @@ describe("describeError", () => {
   });
 });
 
-describe("isTransientNetworkError", () => {
-  test("連線層錯誤算暫時性", () => {
-    for (const code of ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "UND_ERR_SOCKET"]) {
+describe("isTransientNetworkError — POST 用，嚴格", () => {
+  // Copilot 按請求計費。連線建立後才斷的錯誤，請求可能已經送達並被處理，
+  // 重試就是付兩次錢，所以只有「確定沒送出去」才重試。
+  test("連線根本沒建立起來 → 可以重試", () => {
+    for (const code of ["ECONNREFUSED", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT"]) {
       assert.equal(isTransientNetworkError(undiciError(code)), true, code);
     }
   });
 
-  test("沒有 code 的 fetch failed 也算（undici 有時不給 code）", () => {
-    assert.equal(isTransientNetworkError(new TypeError("fetch failed")), true);
+  test("連線建立後才斷 → 不重試（可能已被上游處理，會重複計費）", () => {
+    for (const code of ["ECONNRESET", "EPIPE", "ETIMEDOUT", "UND_ERR_SOCKET", "UND_ERR_HEADERS_TIMEOUT"]) {
+      assert.equal(isTransientNetworkError(undiciError(code)), false, code);
+    }
+  });
+
+  test("沒有 code 的 fetch failed → 情況不明，不重試", () => {
+    assert.equal(isTransientNetworkError(new TypeError("fetch failed")), false);
   });
 
   test("語意錯誤不算 —— 重試只會再錯一次", () => {
@@ -49,8 +58,25 @@ describe("isTransientNetworkError", () => {
     assert.equal(isTransientNetworkError(new Error("Not authorized")), false);
   });
 
-  test("非暫時性的 code 不算", () => {
+  test("非網路的 code 不算", () => {
     assert.equal(isTransientNetworkError(undiciError("ENOTFOUND")), false);
+  });
+});
+
+describe("isRetryableForIdempotent — GET 用，放寬", () => {
+  test("GET 重送沒副作用，連線建立後才斷的也重試", () => {
+    for (const code of ["ECONNREFUSED", "ECONNRESET", "EPIPE", "UND_ERR_SOCKET"]) {
+      assert.equal(isRetryableForIdempotent(undiciError(code)), true, code);
+    }
+  });
+
+  test("沒有 code 的 fetch failed 也重試", () => {
+    assert.equal(isRetryableForIdempotent(new TypeError("fetch failed")), true);
+  });
+
+  test("語意錯誤仍然不重試", () => {
+    assert.equal(isRetryableForIdempotent(new Error("HTTP 400")), false);
+    assert.equal(isRetryableForIdempotent(undiciError("ENOTFOUND")), false);
   });
 });
 
@@ -70,7 +96,7 @@ describe("fetchWithRetry", () => {
     const res = await fetchWithRetry(
       async () => {
         calls++;
-        if (calls === 1) throw undiciError("ECONNRESET");
+        if (calls === 1) throw undiciError("ECONNREFUSED");
         return "recovered";
       },
       { label: "t" }
@@ -86,7 +112,7 @@ describe("fetchWithRetry", () => {
         fetchWithRetry(
           async () => {
             calls++;
-            throw undiciError("ECONNRESET");
+            throw undiciError("ECONNREFUSED");
           },
           { label: "t" }
         ),
@@ -117,11 +143,41 @@ describe("fetchWithRetry", () => {
       fetchWithRetry(
         async () => {
           calls++;
-          throw undiciError("ECONNRESET");
+          throw undiciError("ECONNREFUSED");
         },
         { label: "t", attempts: 3 }
       )
     );
     assert.equal(calls, 3);
+  });
+});
+
+describe("fetchWithRetry — idempotent 旗標", () => {
+  test("POST（預設）遇到 ECONNRESET 不重試", async () => {
+    let calls = 0;
+    await assert.rejects(() =>
+      fetchWithRetry(
+        async () => {
+          calls++;
+          throw undiciError("ECONNRESET");
+        },
+        { label: "post" }
+      )
+    );
+    assert.equal(calls, 1, "POST 不該重試已可能送達的請求");
+  });
+
+  test("idempotent:true 遇到 ECONNRESET 會重試", async () => {
+    let calls = 0;
+    const res = await fetchWithRetry(
+      async () => {
+        calls++;
+        if (calls < 2) throw undiciError("ECONNRESET");
+        return "ok";
+      },
+      { label: "get", idempotent: true }
+    );
+    assert.equal(res, "ok");
+    assert.equal(calls, 2);
   });
 });

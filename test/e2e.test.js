@@ -667,6 +667,36 @@ describe("原生 passthrough — 串流", () => {
     assert.equal(md.data.usage.output_tokens_details.thinking_tokens, 29);
   });
 
+  test("message_stop 被 TCP 分片切開時不該補出第二個", async () => {
+    // 逐 chunk 用 includes() 檢查會漏掉被切斷的字串，然後在結尾補上重複的
+    // 終止事件。這裡手工組一段「message_stop 只出現一次」的 SSE 再切開它 ——
+    // 真上游的事件裡 event: 行和 data JSON 各有一次，兩次同時被切開的機率很低，
+    // 所以這個 bug 實務上罕見，但把偵測寫對成本也很低。
+    const raw = 'event: message_stop\ndata: {"type":"done"}\n\n';
+    const cut = raw.indexOf("message_stop") + 7; // 切在 "message" 之後
+    assert.ok(!raw.slice(0, cut).includes("message_stop"), "前半段不該含完整字串");
+    assert.ok(!raw.slice(cut).includes("message_stop"), "後半段也不該含完整字串");
+
+    nativeHandler = (req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(
+        anthEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "text_delta", text: "x" },
+        })
+      );
+      res.write(raw.slice(0, cut));
+      setTimeout(() => {
+        res.write(raw.slice(cut));
+        res.end();
+      }, 20);
+    };
+    const events = parseSSE(await (await messagesRequest({ ...MINIMAL, stream: true })).text());
+    const stops = events.filter((e) => e.event === "message_stop");
+    assert.equal(stops.length, 1, `應該只有一個 message_stop，實際 ${stops.length} 個`);
+  });
+
   test("上游沒送 message_stop 時補上（否則 client 會一直等）", async () => {
     nativeHandler = (req, res) => {
       sseUpstream(res, [

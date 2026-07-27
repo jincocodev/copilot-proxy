@@ -57,9 +57,12 @@ let modelsCache = { ids: null, data: null, byId: null, fetchedAt: 0, inFlight: n
 
 async function fetchUpstreamModels() {
   const copilotToken = await ensureCopilotToken();
-  const res = await fetch(`${state.apiBaseUrl}/models`, {
-    headers: buildHeaders(copilotToken),
-  });
+  const headers = buildHeaders(copilotToken);
+  // GET 是 idempotent，重試沒有重複計費的顧慮，可以放寬到連線建立後才斷的錯誤
+  const res = await fetchWithRetry(
+    () => fetch(`${state.apiBaseUrl}/models`, { headers }),
+    { label: "GET /models", attempts: 3, idempotent: true }
+  );
   if (!res.ok) throw new Error(`Upstream /models failed: HTTP ${res.status}`);
   const json = await res.json();
   const all = Array.isArray(json.data) ? json.data : [];
@@ -85,7 +88,7 @@ async function getUpstreamModels() {
       modelsCache = { ...fetched, fetchedAt: Date.now(), inFlight: null };
       return modelsCache;
     } catch (err) {
-      console.error(`⚠️  取不到上游模型清單，改用靜態對照：${err.message}`);
+      console.error(`⚠️  取不到上游模型清單，改用靜態對照：${describeError(err)}`);
       modelsCache.inFlight = null;
       // 有舊資料就繼續用舊的，別因為一次失敗就退化
       return modelsCache.ids ? modelsCache : null;
@@ -107,37 +110,55 @@ function describeError(err) {
   return parts.join(" | ");
 }
 
-// 連線層的暫時性失敗（對方斷線、DNS 抖動…）。上游已經回了 HTTP 狀態碼的不算，
-// 那是語意錯誤，重試只會再錯一次。
-const TRANSIENT_CODES = new Set([
+// 我們重試的是 POST，而 Copilot 是按請求計費的。所以只有在「請求確定沒送達
+// 上游」時才能重試 —— 否則上游可能已經處理完、只是回應在路上掉了，重試就是
+// 付兩次錢。
+//
+// 連線根本沒建立起來，請求不可能送出去：重試安全。
+const RETRY_SAFE_CODES = new Set([
+  "ECONNREFUSED", // 對方沒在聽
+  "EAI_AGAIN", // DNS 暫時查不到
+  "UND_ERR_CONNECT_TIMEOUT", // 連線階段就逾時
+]);
+
+// 連線建立之後才斷的：請求可能已經送達並被處理。不重試，讓 client 自己決定
+// （Claude Code 本來就會重試，而且它知道自己的上下文）。
+const RETRY_UNSAFE_CODES = new Set([
   "ECONNRESET",
-  "ECONNREFUSED",
   "EPIPE",
   "ETIMEDOUT",
-  "EAI_AGAIN",
   "UND_ERR_SOCKET",
-  "UND_ERR_CONNECT_TIMEOUT",
   "UND_ERR_HEADERS_TIMEOUT",
 ]);
 
-function isTransientNetworkError(err) {
+// GET 專用：重送沒有副作用，所以連線建立後才斷的也值得重試
+function isRetryableForIdempotent(err) {
   const code = err?.cause?.code || err?.code;
-  // 有明確的 code 就以它為準 —— 像 ENOTFOUND（DNS 查不到）重試也不會變
-  if (code) return TRANSIENT_CODES.has(code);
-  // 沒有 code 時只能看訊息。undici 的連線失敗都是 TypeError: fetch failed，
-  // 有時不帶 code，那種情況值得重試一次。
+  if (code) return RETRY_SAFE_CODES.has(code) || RETRY_UNSAFE_CODES.has(code);
   return err?.name === "TypeError" && /fetch failed/i.test(err?.message || "");
 }
 
+function isTransientNetworkError(err) {
+  const code = err?.cause?.code || err?.code;
+  // 有明確的 code 就以它為準
+  if (code) return RETRY_SAFE_CODES.has(code);
+  // 沒有 code 的 undici "fetch failed" 情況不明 —— 可能已送達，所以不重試。
+  // 寧可讓 client 看到 502 自己重試，也不要偷偷付兩次錢。
+  return false;
+}
+
 // 只在還沒開始寫回應之前重試 —— 串流一旦吐出位元組就不能重來
-async function fetchWithRetry(doFetch, { label, attempts = 2 } = {}) {
+// idempotent: true 代表這個請求重送不會有副作用（GET），可以連「送達後才斷」
+// 的錯誤也一起重試。POST 一律用嚴格判斷，見 isTransientNetworkError。
+async function fetchWithRetry(doFetch, { label, attempts = 2, idempotent = false } = {}) {
+  const retryable = idempotent ? isRetryableForIdempotent : isTransientNetworkError;
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try {
       return await doFetch();
     } catch (err) {
       lastErr = err;
-      if (i === attempts - 1 || !isTransientNetworkError(err)) throw err;
+      if (i === attempts - 1 || !retryable(err)) throw err;
       const wait = 300 * (i + 1);
       console.warn(`⚠️  ${label} 連線失敗，${wait}ms 後重試：${describeError(err)}`);
       await new Promise((r) => setTimeout(r, wait));
@@ -427,13 +448,21 @@ async function pipeNativeStream(upstream, res, { label, start }) {
   let bytes = 0;
   let sawMessageStop = false;
 
+  // "message_stop" 可能剛好被 TCP 分片切成兩半（例如 "...messa" + "ge_stop..."）。
+  // 逐 chunk 用 includes() 檢查會漏掉，然後在結尾補上第二個 message_stop ——
+  // 重複的終止事件會讓 client 困惑。所以留一段跨 chunk 的尾巴一起比對。
+  const NEEDLE = "message_stop";
+  let tail = "";
+
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       const chunk = decoder.decode(value, { stream: true });
       bytes += chunk.length;
-      if (chunk.includes("message_stop")) sawMessageStop = true;
+      if (!sawMessageStop && (tail + chunk).includes(NEEDLE)) sawMessageStop = true;
+      // 只需要留 needle 長度 - 1 個字元就足以接上被切斷的部分
+      tail = (tail + chunk).slice(-(NEEDLE.length - 1));
       res.write(chunk);
     }
 
@@ -515,6 +544,7 @@ async function nativeCountTokens(req, resolvedId) {
 export {
   describeError,
   isTransientNetworkError,
+  isRetryableForIdempotent,
   fetchWithRetry,
   DEFAULT_THINKING_EFFORT,
   DEFAULT_MODEL_OVERRIDE,
