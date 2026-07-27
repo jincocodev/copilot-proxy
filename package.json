@@ -1,10 +1,11 @@
 {
   "name": "copilot-proxy",
-  "version": "1.0.0",
-  "description": "Lightweight OpenAI-compatible proxy for GitHub Copilot API with automatic token management",
+  "version": "1.1.0",
+  "description": "Lightweight proxy exposing GitHub Copilot through both OpenAI-compatible and Anthropic Messages APIs, with automatic token management",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "dotenv": "^17.3.1",
