@@ -5,9 +5,10 @@ import {
   estimateTokens,
   anthropicError,
   mapModel,
+  classifyTier,
+  stripDateSuffix,
 } from "./anthropic-adapter.js";
 import { AnthropicStreamTranslator } from "./anthropic-stream.js";
-import { classifyTier, stripDateSuffix } from "./anthropic-adapter.js";
 import {
   supportsNativeMessages,
   prepareNativeBody,
@@ -94,6 +95,57 @@ async function getUpstreamModels() {
   return modelsCache.inFlight;
 }
 
+// Node 的 fetch 把真正的原因藏在 err.cause 裡，只印 message 會得到一句
+// 毫無資訊的 "fetch failed"。實際遇過，所以一定要展開。
+function describeError(err) {
+  const parts = [err?.message || String(err)];
+  const cause = err?.cause;
+  if (cause) {
+    const bits = [cause.code, cause.errno, cause.syscall, cause.message].filter(Boolean);
+    if (bits.length > 0) parts.push(`cause=${bits.join(" ")}`);
+  }
+  return parts.join(" | ");
+}
+
+// 連線層的暫時性失敗（對方斷線、DNS 抖動…）。上游已經回了 HTTP 狀態碼的不算，
+// 那是語意錯誤，重試只會再錯一次。
+const TRANSIENT_CODES = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "EPIPE",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+  "UND_ERR_SOCKET",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+]);
+
+function isTransientNetworkError(err) {
+  const code = err?.cause?.code || err?.code;
+  // 有明確的 code 就以它為準 —— 像 ENOTFOUND（DNS 查不到）重試也不會變
+  if (code) return TRANSIENT_CODES.has(code);
+  // 沒有 code 時只能看訊息。undici 的連線失敗都是 TypeError: fetch failed，
+  // 有時不帶 code，那種情況值得重試一次。
+  return err?.name === "TypeError" && /fetch failed/i.test(err?.message || "");
+}
+
+// 只在還沒開始寫回應之前重試 —— 串流一旦吐出位元組就不能重來
+async function fetchWithRetry(doFetch, { label, attempts = 2 } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await doFetch();
+    } catch (err) {
+      lastErr = err;
+      if (i === attempts - 1 || !isTransientNetworkError(err)) throw err;
+      const wait = 300 * (i + 1);
+      console.warn(`⚠️  ${label} 連線失敗，${wait}ms 後重試：${describeError(err)}`);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw lastErr;
+}
+
 // COPILOT_DEFAULT_MODEL 的套用規則。
 // 刻意跳過 haiku 階：那是 Claude Code 跑背景小任務用的，把它抬成 opus
 // 只會白花錢，而且那些任務不需要好模型。
@@ -131,14 +183,16 @@ async function callCopilot(openaiBody) {
   const agent =
     Array.isArray(openaiBody.tools) && openaiBody.tools.length > 0;
 
-  return fetch(targetUrl, {
-    method: "POST",
-    headers: buildHeaders(copilotToken, {
-      vision: hasImageContent(openaiBody),
-      agent,
-    }),
-    body: JSON.stringify(openaiBody),
+  const headers = buildHeaders(copilotToken, {
+    vision: hasImageContent(openaiBody),
+    agent,
   });
+  const payload = JSON.stringify(openaiBody);
+
+  return fetchWithRetry(
+    () => fetch(targetUrl, { method: "POST", headers, body: payload }),
+    { label: openaiBody.model || "chat/completions" }
+  );
 }
 
 // ── OpenAI 相容端點（原本的行為，未改動語意）────────────────
@@ -192,7 +246,7 @@ async function proxyRequest(req, res) {
     console.log(`✅ ${model} 200 (${Date.now() - start}ms)${isStream ? " [stream]" : ""}`);
     return { success: true };
   } catch (err) {
-    console.error(`❌ ${model} 502 (${Date.now() - start}ms): ${err.message}`);
+    console.error(`❌ ${model} 502 (${Date.now() - start}ms): ${describeError(err)}`);
     res.status(502).json({
       error: {
         message: err.message || "Proxy error",
@@ -274,7 +328,7 @@ async function anthropicRequest(req, res) {
     console.log(`✅ [anthropic] ${label} 200 (${Date.now() - start}ms)`);
     return { success: true };
   } catch (err) {
-    console.error(`❌ [anthropic] ${label} 502 (${Date.now() - start}ms): ${err.message}`);
+    console.error(`❌ [anthropic] ${label} 502 (${Date.now() - start}ms): ${describeError(err)}`);
     if (!res.headersSent) {
       res.status(502).json(anthropicError(502, err.message || "Proxy error"));
     } else {
@@ -306,14 +360,15 @@ async function nativeAnthropicRequest(req, res, { requestedModel, resolvedId, mo
 
   try {
     const copilotToken = await ensureCopilotToken();
-    const upstream = await fetch(`${state.apiBaseUrl}/v1/messages`, {
-      method: "POST",
-      headers: buildNativeHeaders(copilotToken, req, {
-        vision: hasNativeImage(body),
-        agent: Array.isArray(body.tools) && body.tools.length > 0,
-      }),
-      body: JSON.stringify(body),
+    const payload = JSON.stringify(body);
+    const headers = buildNativeHeaders(copilotToken, req, {
+      vision: hasNativeImage(body),
+      agent: Array.isArray(body.tools) && body.tools.length > 0,
     });
+    const upstream = await fetchWithRetry(
+      () => fetch(`${state.apiBaseUrl}/v1/messages`, { method: "POST", headers, body: payload }),
+      { label: `[native] ${label}` }
+    );
 
     if (!upstream.ok) {
       const errText = await upstream.text();
@@ -348,7 +403,7 @@ async function nativeAnthropicRequest(req, res, { requestedModel, resolvedId, mo
     );
     return { success: true };
   } catch (err) {
-    console.error(`❌ [native] ${label} 502 (${Date.now() - start}ms): ${err.message}`);
+    console.error(`❌ [native] ${label} 502 (${Date.now() - start}ms): ${describeError(err)}`);
     if (!res.headersSent) {
       res.status(502).json(anthropicError(502, err.message || "Proxy error"));
     } else {
@@ -391,7 +446,7 @@ async function pipeNativeStream(upstream, res, { label, start }) {
     console.log(`✅ [native] ${label} 200 (${Date.now() - start}ms) [stream] ${bytes}B`);
     return { success: true };
   } catch (err) {
-    console.error(`❌ [native] ${label} stream aborted (${Date.now() - start}ms): ${err.message}`);
+    console.error(`❌ [native] ${label} stream aborted (${Date.now() - start}ms): ${describeError(err)}`);
     try {
       res.write(
         `event: error\ndata: ${JSON.stringify({
@@ -434,7 +489,7 @@ async function streamAnthropic(upstream, res, { model, inputTokens, label, start
     return { success: true };
   } catch (err) {
     // 一定要把開著的 content block 關掉，否則 Claude Code 會一直等
-    console.error(`❌ [anthropic] ${label} stream aborted (${Date.now() - start}ms): ${err.message}`);
+    console.error(`❌ [anthropic] ${label} stream aborted (${Date.now() - start}ms): ${describeError(err)}`);
     try {
       res.write(translator.abort(err.message));
       res.end();
@@ -458,6 +513,9 @@ async function nativeCountTokens(req, resolvedId) {
 }
 
 export {
+  describeError,
+  isTransientNetworkError,
+  fetchWithRetry,
   DEFAULT_THINKING_EFFORT,
   DEFAULT_MODEL_OVERRIDE,
   applyModelOverride,
