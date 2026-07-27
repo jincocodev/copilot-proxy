@@ -4,14 +4,20 @@ services:
     container_name: copilot-proxy
     restart: unless-stopped
     ports:
-      - "3456:3456"
+      # 只綁 loopback。若要讓 LAN 內其他機器連，改成 "3456:3456"
+      # （但那樣就一定要設 PROXY_API_KEY）
+      - "127.0.0.1:3456:3456"
+    env_file:
+      - .env
     environment:
-      - PROXY_API_KEY=${PROXY_API_KEY}
+      # GitHub token 存在 volume 裡，容器重建也不用重新授權
       - CREDENTIALS_PATH=/data/.credentials.json
     volumes:
       - ./data:/data
     healthcheck:
+      # /health 不需要 API key
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:3456/health"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 10s

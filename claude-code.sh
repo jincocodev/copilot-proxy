@@ -29,13 +29,15 @@ HEALTH="$(curl -fsS --max-time 5 "$PROXY_URL/health" 2>/dev/null || true)"
 
 if [[ -z "$HEALTH" ]]; then
   echo "✗ proxy 沒有回應：$PROXY_URL" >&2
-  echo "  先啟動它：cd '$SCRIPT_DIR' && npm start" >&2
+  echo "  先啟動它（二選一）：" >&2
+  echo "    cd '$SCRIPT_DIR' && docker compose up -d   # Docker，開機自動起" >&2
+  echo "    cd '$SCRIPT_DIR' && npm start              # 直接跑" >&2
   exit 1
 fi
 
 if [[ "$HEALTH" != *'"authorized":true'* ]]; then
   echo "✗ proxy 還沒完成 GitHub 授權。" >&2
-  echo "  執行：curl -X POST $PROXY_URL/admin/auth -H \"Authorization: Bearer \$PROXY_API_KEY\"" >&2
+  echo "  執行：cd '$SCRIPT_DIR' && ./auth.sh" >&2
   exit 1
 fi
 

@@ -5,38 +5,62 @@
 - `/v1/chat/completions` — OpenAI 相容（Dify、Xcode Intelligence、OpenAI SDK…）
 - `/v1/messages` — Anthropic Messages（**Claude Code**、Anthropic SDK）
 
-## 快速開始
-
-### Docker（推薦）
+## 快速開始（Docker，推薦）
 
 ```bash
-cp .env.example .env   # 填 PROXY_API_KEY
+# 1. 產生一組隨機 PROXY_API_KEY
+printf 'PROXY_API_KEY=%s\n' "$(openssl rand -hex 24)" > .env && chmod 600 .env
+
+# 2. 起容器（restart: unless-stopped，Docker 開著就會自動復活）
 docker compose up -d
+
+# 3. GitHub 授權（只需一次，會幫你開瀏覽器並複製代碼）
+./auth.sh
+
+# 4. 用它跑 Claude Code
+./claude-code.sh
 ```
 
-### 本機
+Port 只綁 `127.0.0.1`，外部連不到。GitHub token 存在 `./data/` volume，容器重建不用重新授權。
+
+常用指令：
+
+```bash
+docker compose logs -f      # 看 log
+docker compose restart      # 重啟
+docker compose down         # 停掉（授權還留著）
+docker compose up -d --build   # 改完 code 重新建置
+```
+
+### 本機直跑（不用 Docker）
 
 ```bash
 npm install
-cp .env.example .env   # 填 PROXY_API_KEY
-npm start
+printf 'PROXY_API_KEY=%s\n' "$(openssl rand -hex 24)" > .env && chmod 600 .env
+npm start        # 另開一個終端
+./auth.sh
+./claude-code.sh
 ```
 
 ## 首次授權
 
 ```bash
+./auth.sh
+```
+
+會觸發 GitHub device flow、印出代碼（macOS 順手複製到剪貼簿並開瀏覽器），然後輪詢到授權完成為止。
+
+手動版：
+
+```bash
 curl -X POST http://localhost:3456/admin/auth \
   -H "Authorization: Bearer YOUR_PROXY_API_KEY"
-
-# 回應會給你 user_code 和 URL
-# 去 https://github.com/login/device 輸入 code
-# 授權完成後自動生效
+# 回應會給你 user_code 和 URL，去 https://github.com/login/device 輸入
 ```
 
 ## 搭配 Claude Code
 
 ```bash
-chmod +x claude-code.sh
 ./claude-code.sh
 ```
 
@@ -230,7 +254,9 @@ npm test
 | `anthropic-adapter.js` | 請求／回應轉譯、model 對照、token 估算 |
 | `anthropic-stream.js` | SSE 串流狀態機（OpenAI chunk → Anthropic 事件） |
 | `token-manager.js` | GitHub device flow、Copilot token 續期 |
+| `auth.sh` | 觸發 GitHub 授權，輪詢到完成 |
 | `claude-code.sh` | 健康檢查 + 帶環境變數啟動 Claude Code |
+| `docker-compose.yml` | 容器設定（loopback-only、data volume、healthcheck） |
 
 ## 注意
 
